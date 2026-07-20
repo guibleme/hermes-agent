@@ -8,9 +8,12 @@ blocks completion, and never upgrades targeted checks into "repo green".
 from __future__ import annotations
 
 import json
+import hashlib
+import os
 import re
 import shlex
 import sqlite3
+import subprocess
 import tempfile
 import threading
 from dataclasses import dataclass
@@ -29,6 +32,9 @@ _MAX_TOTAL_UNREFERENCED_EVENTS = 10_000
 _AD_HOC_SCRIPT_NAME_PREFIXES = ("hermes-verify-", "hermes-ad-hoc-")
 _VERIFY_SCHEMA_VERSION = 1
 _SHELL_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||;)\s*")
+_MAX_WORKTREE_PATHS = 5_000
+_MAX_FINGERPRINT_FILE_BYTES = 1_048_576
+_MAX_FINGERPRINT_TOTAL_BYTES = 8_388_608
 
 
 @dataclass(frozen=True)
@@ -45,6 +51,118 @@ class VerificationEvidence:
     root: str
     session_id: str
     output_summary: str = ""
+
+
+@dataclass(frozen=True)
+class WorktreeSnapshot:
+    """Content-free state used to discover terminal-only Git worktree edits."""
+
+    root: str
+    head: str | None
+    fingerprints: dict[str, str]
+
+
+def _git_output(root: Path, *args: str) -> bytes | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), *args],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _git_root(cwd: str | Path | None) -> Path | None:
+    candidate = Path(cwd or Path.cwd()).expanduser()
+    if candidate.is_file():
+        candidate = candidate.parent
+    raw = _git_output(candidate, "rev-parse", "--show-toplevel")
+    if raw is None:
+        return None
+    try:
+        return Path(os.fsdecode(raw).strip()).resolve()
+    except (OSError, ValueError):
+        return None
+
+
+def _nul_paths(raw: bytes | None) -> set[str]:
+    if raw is None:
+        return set()
+    return {
+        os.fsdecode(part)
+        for part in raw.split(b"\0")
+        if part and os.fsdecode(part)
+    }
+
+
+def _dirty_paths(root: Path) -> set[str] | None:
+    tracked = _git_output(root, "diff", "--name-only", "-z", "HEAD", "--")
+    untracked = _git_output(root, "ls-files", "--others", "--exclude-standard", "-z")
+    if tracked is None or untracked is None:
+        return None
+    paths = _nul_paths(tracked) | _nul_paths(untracked)
+    return paths if len(paths) <= _MAX_WORKTREE_PATHS else None
+
+
+def _path_fingerprint(path: Path, remaining_bytes: int) -> tuple[str, int]:
+    try:
+        stat_result = path.lstat()
+    except OSError:
+        return "missing", remaining_bytes
+    prefix = f"{stat_result.st_mode}:{stat_result.st_size}:{stat_result.st_mtime_ns}"
+    if not path.is_file() or stat_result.st_size > _MAX_FINGERPRINT_FILE_BYTES:
+        return prefix, remaining_bytes
+    if stat_result.st_size > remaining_bytes:
+        return prefix, remaining_bytes
+    try:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return prefix, remaining_bytes
+    return f"{prefix}:{digest}", remaining_bytes - stat_result.st_size
+
+
+def capture_worktree_snapshot(cwd: str | Path | None = None) -> WorktreeSnapshot | None:
+    """Capture bounded fingerprints of the current Git worktree's dirty paths."""
+
+    root = _git_root(cwd)
+    if root is None:
+        return None
+    paths = _dirty_paths(root)
+    if paths is None:
+        return None
+    head_raw = _git_output(root, "rev-parse", "HEAD")
+    head = os.fsdecode(head_raw).strip() if head_raw else None
+    remaining = _MAX_FINGERPRINT_TOTAL_BYTES
+    fingerprints: dict[str, str] = {}
+    for relative in sorted(paths):
+        fingerprint, remaining = _path_fingerprint(root / relative, remaining)
+        fingerprints[relative] = fingerprint
+    return WorktreeSnapshot(str(root), head, fingerprints)
+
+
+def changed_paths_since_snapshot(snapshot: WorktreeSnapshot | None) -> list[str]:
+    """Return paths whose worktree state changed after ``snapshot`` was captured."""
+
+    if snapshot is None:
+        return []
+    root = Path(snapshot.root)
+    current = capture_worktree_snapshot(root)
+    if current is None or current.root != snapshot.root:
+        return []
+    changed = {
+        relative
+        for relative in set(snapshot.fingerprints) | set(current.fingerprints)
+        if snapshot.fingerprints.get(relative) != current.fingerprints.get(relative)
+    }
+    if snapshot.head and current.head and snapshot.head != current.head:
+        changed.update(
+            _nul_paths(_git_output(root, "diff", "--name-only", "-z", snapshot.head, current.head, "--"))
+        )
+    return [str((root / relative).resolve()) for relative in sorted(changed)]
 
 
 def _utc_now() -> str:

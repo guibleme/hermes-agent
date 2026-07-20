@@ -1,15 +1,82 @@
 import json
 import sqlite3
+import subprocess
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from agent.verification_evidence import (
+    capture_worktree_snapshot,
+    changed_paths_since_snapshot,
     classify_verification_command,
     mark_workspace_edited,
     record_terminal_result,
     verification_status,
 )
+
+
+def _git(root: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+
+
+def _git_project(root: Path) -> None:
+    _git(root, "init", "-b", "main")
+    _git(root, "config", "user.email", "canary@example.invalid")
+    _git(root, "config", "user.name", "Canary")
+    (root / "tracked.py").write_text("VALUE = 1\n", encoding="utf-8")
+    _git(root, "add", "tracked.py")
+    _git(root, "commit", "-m", "seed")
+
+
+def test_worktree_snapshot_detects_terminal_style_edits(tmp_path):
+    _git_project(tmp_path)
+    snapshot = capture_worktree_snapshot(tmp_path)
+
+    tracked = tmp_path / "tracked.py"
+    created = tmp_path / "created.py"
+    tracked.write_text("VALUE = 2\n", encoding="utf-8")
+    created.write_text("CREATED = True\n", encoding="utf-8")
+
+    assert changed_paths_since_snapshot(snapshot) == [str(created), str(tracked)]
+
+
+def test_worktree_snapshot_ignores_untouched_preexisting_changes(tmp_path):
+    _git_project(tmp_path)
+    tracked = tmp_path / "tracked.py"
+    tracked.write_text("VALUE = 'already dirty'\n", encoding="utf-8")
+    snapshot = capture_worktree_snapshot(tmp_path)
+
+    assert changed_paths_since_snapshot(snapshot) == []
+
+
+def test_worktree_snapshot_detects_existing_dirty_file_changed_again(tmp_path):
+    _git_project(tmp_path)
+    tracked = tmp_path / "tracked.py"
+    tracked.write_text("VALUE = 'already dirty'\n", encoding="utf-8")
+    snapshot = capture_worktree_snapshot(tmp_path)
+    tracked.write_text("VALUE = 'changed this turn'\n", encoding="utf-8")
+
+    assert changed_paths_since_snapshot(snapshot) == [str(tracked)]
+
+
+def test_worktree_snapshot_detects_terminal_style_deletion(tmp_path):
+    _git_project(tmp_path)
+    snapshot = capture_worktree_snapshot(tmp_path)
+    tracked = tmp_path / "tracked.py"
+    tracked.unlink()
+
+    assert changed_paths_since_snapshot(snapshot) == [str(tracked)]
+
+
+def test_worktree_snapshot_detects_commit_created_during_turn(tmp_path):
+    _git_project(tmp_path)
+    snapshot = capture_worktree_snapshot(tmp_path)
+    tracked = tmp_path / "tracked.py"
+    tracked.write_text("VALUE = 3\n", encoding="utf-8")
+    _git(tmp_path, "add", "tracked.py")
+    _git(tmp_path, "commit", "-m", "change")
+
+    assert changed_paths_since_snapshot(snapshot) == [str(tracked)]
 
 
 def _node_project(root: Path) -> None:
@@ -286,6 +353,8 @@ def test_file_tool_stales_evidence_by_session_id_for_absolute_edit(tmp_path, mon
     )
 
     from tools.file_tools import write_file_tool
+
+    monkeypatch.setattr("tools.file_tools._check_sensitive_path", lambda *_args: None)
 
     result = json.loads(
         write_file_tool(

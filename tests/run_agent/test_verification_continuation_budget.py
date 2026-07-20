@@ -104,6 +104,30 @@ def test_pre_verify_preserves_composed_report_at_budget_limit(agent, monkeypatch
     assert result["messages"][2]["_pre_verify_synthetic"] is True
 
 
+def test_terminal_worktree_changes_reach_pre_verify(agent, monkeypatch):
+    agent._interruptible_api_call = lambda _api_kwargs: _response()
+    agent._handle_max_iterations = MagicMock(return_value="replacement summary")
+    pre_verify = MagicMock(return_value="run project tests")
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    with (
+        patch(
+            "agent.verification_evidence.changed_paths_since_snapshot",
+            return_value=["/workspace/terminal-edit.py"],
+        ),
+        patch("hermes_cli.plugins.has_hook", side_effect=lambda name: name == "pre_verify"),
+        patch("hermes_cli.plugins.get_pre_verify_continue_message", pre_verify),
+        patch("agent.verify_hooks.max_verify_nudges", return_value=2),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("edit through terminal")
+
+    _assert_pending_response_survives(agent, result)
+    assert pre_verify.call_args.kwargs["changed_paths"] == [
+        "/workspace/terminal-edit.py"
+    ]
+
+
 def test_intermediate_ack_uses_summary_instead_of_premature_text(agent, monkeypatch):
     agent.valid_tool_names = ["web_search"]
     agent._intent_ack_continuation = True
