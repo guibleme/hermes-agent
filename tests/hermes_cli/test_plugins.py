@@ -694,6 +694,64 @@ class TestPluginHooks:
             "hermes.observer.v1"
         ]
 
+    @pytest.mark.parametrize(
+        ("platform", "dashboard_marker", "expected"),
+        [
+            ("cli", False, "cli"),
+            ("telegram", False, "telegram"),
+            ("desktop", False, "desktop"),
+            ("tui", False, "tui"),
+            ("tui", True, "dashboard"),
+        ],
+    )
+    def test_invoke_hook_adds_observer_surface(
+        self, tmp_path, monkeypatch, platform, dashboard_marker, expected
+    ):
+        """Surface attribution is additive and does not rewrite platform."""
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        _make_plugin_dir(
+            plugins_dir,
+            "surface_plugin",
+            register_body=(
+                'ctx.register_hook("pre_llm_call", '
+                'lambda **kw: {"platform": kw.get("platform"), '
+                '"surface": kw.get("surface")})'
+            ),
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+        if dashboard_marker:
+            monkeypatch.setenv("HERMES_TUI_DASHBOARD", "1")
+        else:
+            monkeypatch.delenv("HERMES_TUI_DASHBOARD", raising=False)
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert mgr.invoke_hook("pre_llm_call", platform=platform) == [
+            {"platform": platform, "surface": expected}
+        ]
+
+    def test_invoke_hook_preserves_explicit_observer_surface(
+        self, tmp_path, monkeypatch
+    ):
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        _make_plugin_dir(
+            plugins_dir,
+            "surface_plugin",
+            register_body=(
+                'ctx.register_hook("pre_llm_call", '
+                'lambda **kw: kw.get("surface"))'
+            ),
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+        monkeypatch.setenv("HERMES_TUI_DASHBOARD", "1")
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert mgr.invoke_hook(
+            "pre_llm_call", platform="tui", surface="embedded-preview"
+        ) == ["embedded-preview"]
+
     def test_hook_exception_does_not_propagate(self, tmp_path, monkeypatch):
         """A hook callback that raises does NOT crash the caller."""
         plugins_dir = tmp_path / "hermes_test" / "plugins"

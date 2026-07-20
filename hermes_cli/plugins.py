@@ -79,6 +79,14 @@ class PluginToolOverrideError(PermissionError):
 logger = logging.getLogger(__name__)
 
 
+def _observer_surface(platform: Any) -> str:
+    """Resolve a UI surface without changing the agent's behavior platform."""
+    normalized = str(platform or "").strip().lower()
+    if normalized == "tui" and env_var_enabled("HERMES_TUI_DASHBOARD"):
+        return "dashboard"
+    return normalized
+
+
 # ---------------------------------------------------------------------------
 # Plugin developer debug logging
 # ---------------------------------------------------------------------------
@@ -1910,6 +1918,9 @@ class PluginManager:
         persisted to session DB.
         """
         kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+        surface = _observer_surface(kwargs.get("platform"))
+        if surface:
+            kwargs.setdefault("surface", surface)
         callbacks = self._hooks.get(hook_name, [])
         results: List[Any] = []
         for cb in callbacks:
