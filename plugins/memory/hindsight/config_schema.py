@@ -72,5 +72,13 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             ),
             inline=True,
         ),
+        ProviderField(
+            key="prefetch_max_tokens",
+            label="Prefetch max tokens",
+            kind=KIND_TEXT,
+            default="",
+            description="Automatic context budget. Empty uses the normal recall maximum.",
+            inline=True,
+        ),
     ),
 )

@@ -305,6 +305,7 @@ class TestConfig:
         assert provider._auto_recall is True
         assert provider._retain_every_n_turns == 1
         assert provider._recall_max_tokens == 4096
+        assert provider._prefetch_max_tokens == 4096
         assert provider._recall_max_input_chars == 800
         assert provider._tags is None
         assert provider._observation_scopes is None
@@ -359,6 +360,7 @@ class TestConfig:
             retain_context="custom-ctx",
             bank_retain_mission="Extract key facts",
             recall_max_tokens=2048,
+            prefetch_max_tokens=64,
             recall_types=["world", "experience"],
             recall_prompt_preamble="Custom preamble:",
             recall_max_input_chars=500,
@@ -377,6 +379,7 @@ class TestConfig:
         assert p._retain_context == "custom-ctx"
         assert p._bank_retain_mission == "Extract key facts"
         assert p._recall_max_tokens == 2048
+        assert p._prefetch_max_tokens == 64
         assert p._recall_types == ["world", "experience"]
         assert p._recall_prompt_preamble == "Custom preamble:"
         assert p._recall_max_input_chars == 500
@@ -854,6 +857,20 @@ class TestPrefetch:
         assert call_kwargs["tags"] == ["t1"]
         assert call_kwargs["tags_match"] == "all"
         assert call_kwargs["types"] == ["world"]
+
+    def test_queue_prefetch_uses_separate_context_budget(self, provider_with_config):
+        p = provider_with_config(
+            recall_max_tokens=4096,
+            prefetch_max_tokens=64,
+            recall_types=["observation"],
+        )
+        p.queue_prefetch("test query")
+        if p._prefetch_thread:
+            p._prefetch_thread.join(timeout=5.0)
+
+        call_kwargs = p._client.arecall.call_args.kwargs
+        assert call_kwargs["max_tokens"] == 64
+        assert p._recall_max_tokens == 4096
 
 
 # ---------------------------------------------------------------------------
@@ -1479,7 +1496,7 @@ class TestConfigSchema:
             "recall_tags", "recall_tags_match",
             "auto_recall", "auto_retain",
             "retain_every_n_turns", "retain_async", "retain_context",
-            "recall_max_tokens", "recall_max_input_chars",
+            "recall_max_tokens", "prefetch_max_tokens", "recall_max_input_chars",
             "recall_prompt_preamble",
         }
         assert expected_keys.issubset(keys), f"Missing: {expected_keys - keys}"
