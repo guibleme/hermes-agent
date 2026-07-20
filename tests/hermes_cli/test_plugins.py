@@ -1143,7 +1143,10 @@ class TestGetPreVerifyContinueMessage:
             return []
 
         monkeypatch.setattr("hermes_cli.plugins.invoke_hook", capture)
-        get_pre_verify_continue_message(coding=True, attempt=2, changed_paths=["a.py"])
+        get_pre_verify_continue_message(
+            turn_id="turn-a", coding=True, attempt=2, changed_paths=["a.py"]
+        )
+        assert seen["turn_id"] == "turn-a"
         assert seen["coding"] is True
         assert seen["attempt"] == 2
         assert seen["changed_paths"] == ["a.py"]

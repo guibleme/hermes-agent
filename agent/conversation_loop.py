@@ -5585,6 +5585,7 @@ def run_conversation(
                             agent._resolved_is_coding = coding
                         _verify_nudge2 = get_pre_verify_continue_message(
                             session_id=getattr(agent, "session_id", None) or "",
+                            turn_id=turn_id,
                             platform=getattr(agent, "platform", "") or "",
                             model=getattr(agent, "model", "") or "",
                             coding=coding,
