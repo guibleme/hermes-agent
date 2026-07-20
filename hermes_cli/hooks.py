@@ -141,6 +141,7 @@ _DEFAULT_PAYLOADS = {
     },
     "pre_verify": {
         "session_id": "test-session",
+        "turn_id": "test-turn",
         "platform": "cli",
         "model": "gpt-4",
         "coding": True,
