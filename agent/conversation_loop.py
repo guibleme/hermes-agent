@@ -5500,13 +5500,24 @@ def run_conversation(
                     messages.pop()
 
                 try:
-                    from agent.verification_evidence import changed_paths_since_snapshot
-
-                    _terminal_changed = changed_paths_since_snapshot(
-                        getattr(agent, "_turn_worktree_snapshot", None)
+                    from agent.verification_evidence import (
+                        changed_paths_since_snapshot,
+                        mark_workspace_edited,
                     )
-                    if _terminal_changed:
-                        agent._turn_file_mutation_paths.update(_terminal_changed)
+
+                    _worktree_snapshot = getattr(agent, "_turn_worktree_snapshot", None)
+                    _terminal_changed = set(
+                        changed_paths_since_snapshot(_worktree_snapshot)
+                    )
+                    _known_changed = getattr(agent, "_turn_file_mutation_paths", set())
+                    _new_terminal_changed = sorted(_terminal_changed - _known_changed)
+                    if _new_terminal_changed:
+                        _known_changed.update(_new_terminal_changed)
+                        mark_workspace_edited(
+                            session_id=getattr(agent, "session_id", None),
+                            cwd=getattr(_worktree_snapshot, "root", None),
+                            paths=_new_terminal_changed,
+                        )
                 except Exception:
                     logger.debug("turn-end worktree comparison failed", exc_info=True)
 

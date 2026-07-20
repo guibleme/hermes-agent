@@ -128,6 +128,43 @@ def test_terminal_worktree_changes_reach_pre_verify(agent, monkeypatch):
     ]
 
 
+def test_terminal_worktree_edit_is_recorded_only_once(agent, monkeypatch):
+    agent.max_iterations = 2
+    agent.iteration_budget.max_total = 2
+    answers = iter([_response("verify next"), _response("verified")])
+    agent._interruptible_api_call = lambda _api_kwargs: next(answers)
+    pre_verify = MagicMock(side_effect=["run project tests", None])
+    record_edit = MagicMock()
+    snapshot = SimpleNamespace(root="/workspace")
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    with (
+        patch(
+            "agent.verification_evidence.capture_worktree_snapshot",
+            return_value=snapshot,
+        ),
+        patch(
+            "agent.verification_evidence.changed_paths_since_snapshot",
+            return_value=["/workspace/terminal-edit.py"],
+        ),
+        patch("agent.verification_evidence.mark_workspace_edited", record_edit),
+        patch("hermes_cli.plugins.has_hook", side_effect=lambda name: name == "pre_verify"),
+        patch("hermes_cli.plugins.get_pre_verify_continue_message", pre_verify),
+        patch("agent.verify_hooks.max_verify_nudges", return_value=2),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("edit through terminal and verify")
+
+    assert result["final_response"] == "verified"
+    assert result["completed"] is True
+    record_edit.assert_called_once_with(
+        session_id="verify-budget-test",
+        cwd="/workspace",
+        paths=["/workspace/terminal-edit.py"],
+    )
+    assert pre_verify.call_count == 2
+
+
 def test_intermediate_ack_uses_summary_instead_of_premature_text(agent, monkeypatch):
     agent.valid_tool_names = ["web_search"]
     agent._intent_ack_continuation = True
