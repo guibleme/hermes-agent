@@ -768,6 +768,13 @@ def build_turn_context(
     # Per-turn file-mutation verifier state.
     agent._turn_failed_file_mutations = {}
     agent._turn_file_mutation_paths = set()
+    try:
+        from agent.verification_evidence import capture_worktree_snapshot
+
+        agent._turn_worktree_snapshot = capture_worktree_snapshot()
+    except Exception:
+        logger.debug("turn-start worktree snapshot failed", exc_info=True)
+        agent._turn_worktree_snapshot = None
     agent._verification_stop_nudges = 0
     agent._pre_verify_nudges = 0
 

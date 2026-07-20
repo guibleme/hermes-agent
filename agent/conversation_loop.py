@@ -5506,6 +5506,17 @@ def run_conversation(
                     messages.pop()
 
                 try:
+                    from agent.verification_evidence import changed_paths_since_snapshot
+
+                    _terminal_changed = changed_paths_since_snapshot(
+                        getattr(agent, "_turn_worktree_snapshot", None)
+                    )
+                    if _terminal_changed:
+                        agent._turn_file_mutation_paths.update(_terminal_changed)
+                except Exception:
+                    logger.debug("turn-end worktree comparison failed", exc_info=True)
+
+                try:
                     from agent.verification_stop import (
                         build_verify_on_stop_nudge,
                         verify_on_stop_enabled,
