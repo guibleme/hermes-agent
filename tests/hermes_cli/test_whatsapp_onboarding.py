@@ -1,5 +1,6 @@
 import asyncio
 import time
+from types import SimpleNamespace
 
 
 class _FakeProc:
@@ -321,3 +322,27 @@ def test_spawn_whatsapp_pairing_process_uses_json_mode(monkeypatch, tmp_path):
     assert str(session_dir) in captured["args"]
     assert captured["kwargs"]["env"]["WHATSAPP_MODE"] == "bot"
     assert captured["kwargs"]["env"]["WHATSAPP_DM_POLICY"] == "pairing"
+
+
+def test_dashboard_dependency_setup_writes_exact_stamp(monkeypatch, tmp_path):
+    from gateway.platforms import whatsapp_common
+    from hermes_cli import web_server as ws
+    import hermes_constants
+
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    (bridge / "package.json").write_text('{"name":"bridge"}\n')
+    (bridge / "package-lock.json").write_text('{"lockfileVersion":3}\n')
+
+    monkeypatch.setattr(hermes_constants, "find_node_executable", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr(hermes_constants, "with_hermes_node_path", lambda: {})
+
+    def fake_run(*args, **kwargs):
+        (bridge / "node_modules").mkdir()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(ws.subprocess, "run", fake_run)
+
+    ws._ensure_whatsapp_bridge_dependencies(bridge)
+
+    assert whatsapp_common.whatsapp_bridge_dependencies_fresh(bridge) is True

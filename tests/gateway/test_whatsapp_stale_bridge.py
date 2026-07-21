@@ -12,8 +12,8 @@ The fix: bridge.js reports a hash of its own source in ``/health``
 and restarts the bridge on mismatch.  Bridges that predate the handshake
 report no hash and are treated as stale by definition.
 
-Also covers the npm dependency-refresh stamp: deps are reinstalled when
-package.json changes, not only when node_modules is missing.
+Also covers the setup-owned dependency stamp: gateway startup proceeds only
+when package.json and package-lock.json match the installed runtime.
 """
 
 import asyncio
@@ -85,6 +85,7 @@ def _setup_bridge_dir(tmp_path: Path) -> Path:
     bridge_dir.mkdir()
     (bridge_dir / "bridge.js").write_text("// current bridge code\n")
     (bridge_dir / "package.json").write_text('{"name": "bridge"}\n')
+    (bridge_dir / "package-lock.json").write_text('{"lockfileVersion": 3}\n')
     session_path = tmp_path / "session"
     session_path.mkdir()
     (session_path / "creds.json").write_text("{}")
@@ -92,14 +93,14 @@ def _setup_bridge_dir(tmp_path: Path) -> Path:
 
 
 def _fresh_node_modules(bridge_dir: Path) -> None:
-    """Create node_modules with a stamp matching the current package.json."""
-    from plugins.platforms.whatsapp.adapter import _file_content_hash
+    """Create node_modules with the shared exact dependency stamp."""
+    from gateway.platforms.whatsapp_common import (
+        mark_whatsapp_bridge_dependencies_fresh,
+    )
 
     nm = bridge_dir / "node_modules"
     nm.mkdir()
-    (nm / ".hermes-pkg-hash").write_text(
-        _file_content_hash(bridge_dir / "package.json")
-    )
+    mark_whatsapp_bridge_dependencies_fresh(bridge_dir)
 
 
 class TestFileContentHash:
@@ -182,7 +183,6 @@ class TestStaleBridgeHandshake:
         mock_proc = MagicMock()
         mock_proc.poll.return_value = 1
         mock_proc.returncode = 1
-
         with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
              patch("aiohttp.ClientSession", mock_client), \
              patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
@@ -210,7 +210,6 @@ class TestStaleBridgeHandshake:
         mock_proc = MagicMock()
         mock_proc.poll.return_value = 1
         mock_proc.returncode = 1
-
         with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
              patch("aiohttp.ClientSession", mock_client), \
              patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
@@ -223,7 +222,7 @@ class TestStaleBridgeHandshake:
         mock_popen.assert_called_once()
 
 
-class TestDepRefreshStamp:
+class TestDependencyReadinessBoundary:
     @pytest.mark.asyncio
     async def test_skips_install_when_stamp_fresh(self, tmp_path):
         bridge_dir = _setup_bridge_dir(tmp_path)
@@ -249,7 +248,7 @@ class TestDepRefreshStamp:
         mock_run.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_reinstalls_when_package_json_changed(self, tmp_path):
+    async def test_package_change_fails_fast_without_install(self, tmp_path):
         bridge_dir = _setup_bridge_dir(tmp_path)
         _fresh_node_modules(bridge_dir)
         # Simulate `hermes update` bumping the Baileys pin
@@ -258,54 +257,37 @@ class TestDepRefreshStamp:
             bridge_script=str(bridge_dir / "bridge.js"),
             session_path=tmp_path / "session",
         )
-        mock_proc = MagicMock()
-        mock_proc.poll.return_value = 1
-        mock_proc.returncode = 1
 
         with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
-             patch("aiohttp.ClientSession", _mock_health({"status": "disconnected"})), \
-             patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
-             patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
-             patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
-             patch("subprocess.run", return_value=MagicMock(returncode=0)) as mock_run, \
-             patch("subprocess.Popen", return_value=mock_proc), \
+             patch("subprocess.run") as mock_run, \
+             patch("subprocess.Popen") as mock_popen, \
              patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True):
-            await adapter.connect()
+            result = await adapter.connect()
 
-        mock_run.assert_called_once()
-        assert "install" in mock_run.call_args[0][0]
-        # Stamp updated to the new package.json hash
-        from plugins.platforms.whatsapp.adapter import _file_content_hash
-        stamp = (bridge_dir / "node_modules" / ".hermes-pkg-hash").read_text().strip()
-        assert stamp == _file_content_hash(bridge_dir / "package.json")
+        assert result is False
+        assert adapter.fatal_error_code == "whatsapp_dependencies_unavailable"
+        assert adapter.fatal_error_retryable is False
+        mock_run.assert_not_called()
+        mock_popen.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_installs_when_node_modules_missing(self, tmp_path):
+    async def test_missing_node_modules_fails_fast_without_install(self, tmp_path):
         bridge_dir = _setup_bridge_dir(tmp_path)  # no node_modules
         adapter = _make_adapter(
             bridge_script=str(bridge_dir / "bridge.js"),
             session_path=tmp_path / "session",
         )
-        mock_proc = MagicMock()
-        mock_proc.poll.return_value = 1
-        mock_proc.returncode = 1
-
-        def _npm_install(*args, **kwargs):
-            # npm creates node_modules as a side effect
-            (bridge_dir / "node_modules").mkdir(exist_ok=True)
-            return MagicMock(returncode=0)
 
         with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
-             patch("aiohttp.ClientSession", _mock_health({"status": "disconnected"})), \
-             patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
-             patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
-             patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
-             patch("subprocess.run", side_effect=_npm_install) as mock_run, \
-             patch("subprocess.Popen", return_value=mock_proc), \
+             patch("subprocess.run") as mock_run, \
+             patch("subprocess.Popen") as mock_popen, \
              patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True):
-            await adapter.connect()
+            result = await adapter.connect()
 
-        mock_run.assert_called_once()
+        assert result is False
+        assert adapter.fatal_error_code == "whatsapp_dependencies_unavailable"
+        mock_run.assert_not_called()
+        mock_popen.assert_not_called()
 
 
 class TestCacheDirEnvPassthrough:

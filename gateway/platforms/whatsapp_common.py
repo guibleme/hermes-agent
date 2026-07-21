@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import re
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 
@@ -461,50 +462,106 @@ class WhatsAppBehaviorMixin:
 # Shared bridge directory resolution for CLI and adapter
 # ---------------------------------------------------------------------------
 
-def resolve_whatsapp_bridge_dir() -> Path:
-    """Resolve the WhatsApp bridge directory, mirroring to HERMES_HOME if needed.
-
-    When the install tree is read-only (e.g., Docker /opt/hermes), this function
-    mirrors the bridge source to a writable HERMES_HOME location and returns that
-    path. This ensures npm install works in Docker environments.
-
-    Returns the resolved bridge directory path.
-    """
+def _sync_whatsapp_bridge_source(install_bridge: Path, runtime_bridge: Path) -> bool:
+    """Refresh runtime source atomically while preserving generated dependencies."""
     import shutil
+    import tempfile
+
+    try:
+        runtime_bridge.mkdir(parents=True, exist_ok=True, mode=0o700)
+        for source in install_bridge.iterdir():
+            if source.name in {"node_modules", ".write_test"}:
+                continue
+            target = runtime_bridge / source.name
+            if source.is_dir():
+                shutil.copytree(source, target, dirs_exist_ok=True)
+                continue
+            if not source.is_file():
+                continue
+            fd, temporary_name = tempfile.mkstemp(
+                prefix=f".{source.name}.",
+                suffix=".tmp",
+                dir=runtime_bridge,
+            )
+            os.close(fd)
+            temporary = Path(temporary_name)
+            try:
+                shutil.copy2(source, temporary)
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
+        return (runtime_bridge / "bridge.js").is_file() and (
+            runtime_bridge / "package.json"
+        ).is_file()
+    except OSError as exc:
+        logger.warning("Could not refresh WhatsApp bridge runtime: %s", exc)
+        return False
+
+
+def whatsapp_bridge_dependency_hash(bridge_dir: Path) -> str:
+    """Return the exact package-plus-lock identity used by bridge dependencies."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    for name in ("package.json", "package-lock.json"):
+        path = bridge_dir / name
+        try:
+            content = path.read_bytes()
+        except OSError:
+            return ""
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(content)
+        digest.update(b"\0")
+    return digest.hexdigest()[:16]
+
+
+def whatsapp_bridge_dependencies_fresh(bridge_dir: Path) -> bool:
+    """Return whether installed dependencies match package and lock manifests."""
+    expected = whatsapp_bridge_dependency_hash(bridge_dir)
+    if not expected or not (bridge_dir / "node_modules").is_dir():
+        return False
+    try:
+        observed = (
+            bridge_dir / "node_modules" / ".hermes-pkg-hash"
+        ).read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    return observed == expected
+
+
+def mark_whatsapp_bridge_dependencies_fresh(bridge_dir: Path) -> None:
+    """Persist the current package-plus-lock identity after a successful install."""
+    dependency_hash = whatsapp_bridge_dependency_hash(bridge_dir)
+    if not dependency_hash:
+        raise OSError("WhatsApp bridge package manifests are unavailable")
+    node_modules = bridge_dir / "node_modules"
+    if not node_modules.is_dir():
+        raise OSError("WhatsApp bridge node_modules was not created")
+    (node_modules / ".hermes-pkg-hash").write_text(
+        dependency_hash,
+        encoding="utf-8",
+    )
+
+
+def resolve_whatsapp_bridge_dir() -> Path:
+    """Resolve a persistent writable bridge runtime under HERMES_HOME.
+
+    Installed source remains authoritative, but generated npm dependencies are
+    runtime state and must survive editable-worktree or package replacement.
+    Source files are refreshed into the runtime mirror without deleting
+    ``node_modules``. If the runtime cannot be prepared, return the install
+    source as a truthful last resort.
+    """
     from pathlib import Path as _Path
 
-    # Default location in install tree (may be read-only)
     from hermes_constants import get_hermes_home
     install_bridge = _Path(__file__).resolve().parents[2] / "scripts" / "whatsapp-bridge"
-
-    # Try HERMES_HOME location first
-    hermes_home = get_hermes_home()
-    hermes_home_bridge = hermes_home / "scripts" / "whatsapp-bridge"
-
-    # Check if install dir is writable
-    try:
-        test_file = install_bridge / ".write_test"
-        test_file.touch()
-        test_file.unlink()
-        install_writable = True
-    except (OSError, PermissionError):
-        install_writable = False
-
-    if install_writable:
+    runtime_bridge = get_hermes_home() / "scripts" / "whatsapp-bridge"
+    if install_bridge == runtime_bridge:
         return install_bridge
-
-    # Install dir is read-only, mirror to HERMES_HOME if needed
-    if hermes_home_bridge.exists():
-        return hermes_home_bridge
-
-    # Mirror the bridge source to HERMES_HOME
-    try:
-        hermes_home_bridge.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(
-            install_bridge,
-            hermes_home_bridge,
-            dirs_exist_ok=False,
-        )
-        return hermes_home_bridge
-    except Exception:
-        return install_bridge
+    if _sync_whatsapp_bridge_source(install_bridge, runtime_bridge):
+        return runtime_bridge
+    if (runtime_bridge / "bridge.js").is_file():
+        return runtime_bridge
+    return install_bridge

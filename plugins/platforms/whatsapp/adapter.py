@@ -263,7 +263,10 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.whatsapp_common import WhatsAppBehaviorMixin
+from gateway.platforms.whatsapp_common import (
+    WhatsAppBehaviorMixin,
+    whatsapp_bridge_dependencies_fresh,
+)
 from gateway.whatsapp_identity import to_whatsapp_jid
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -274,7 +277,6 @@ from gateway.platforms.base import (
     cache_image_from_url,
     cache_audio_from_url,
 )
-from utils import env_int
 
 
 def _is_allowed_bridge_path(url: str) -> bool:
@@ -520,49 +522,20 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             logger.warning("[%s] Could not acquire session lock (non-fatal): %s", self.name, e)
 
         try:
-            # Auto-install npm dependencies when node_modules is missing OR
-            # package.json changed since the last install (e.g. after
-            # `hermes update` bumps the Baileys pin).  The stamp file records
-            # the package.json hash of the last successful install.
             bridge_dir = bridge_path.parent
-            _pkg_json = bridge_dir / "package.json"
-            _dep_stamp = bridge_dir / "node_modules" / ".hermes-pkg-hash"
-            _pkg_hash = _file_content_hash(_pkg_json)
-            _deps_fresh = False
-            if (bridge_dir / "node_modules").exists():
-                try:
-                    _deps_fresh = (_dep_stamp.read_text().strip() == _pkg_hash) and bool(_pkg_hash)
-                except OSError:
-                    _deps_fresh = False
-            if not _deps_fresh:
-                print(f"[{self.name}] Installing WhatsApp bridge dependencies...")
-                # Resolve npm path so Windows uses npm.cmd from the
-                # Hermes-managed portable Node before falling back to PATH.
-                _npm_bin = find_node_executable("npm") or "npm"
-                try:
-                    # Read timeout from environment variable, default to 300 seconds (5 minutes)
-                    # to accommodate slower systems like Unraid NAS
-                    npm_install_timeout = env_int("WHATSAPP_NPM_INSTALL_TIMEOUT", 300)
-                    install_result = subprocess.run(
-                        [_npm_bin, "install", "--silent"],
-                        cwd=str(bridge_dir),
-                        capture_output=True,
-                        text=True,
-                        timeout=npm_install_timeout,
-                        env=with_hermes_node_path(),
-                    )
-                    if install_result.returncode != 0:
-                        print(f"[{self.name}] npm install failed: {install_result.stderr}")
-                        return False
-                    print(f"[{self.name}] Dependencies installed")
-                    if _pkg_hash:
-                        try:
-                            _dep_stamp.write_text(_pkg_hash)
-                        except OSError:
-                            pass  # Stamp is an optimization; install still succeeded
-                except Exception as e:
-                    print(f"[{self.name}] Failed to install dependencies: {e}")
-                    return False
+            if not whatsapp_bridge_dependencies_fresh(bridge_dir):
+                logger.warning(
+                    "[%s] WhatsApp bridge dependencies are missing or stale at %s. "
+                    "Run `hermes whatsapp` or use Dashboard setup before restarting the gateway.",
+                    self.name,
+                    bridge_dir,
+                )
+                self._set_fatal_error(
+                    "whatsapp_dependencies_unavailable",
+                    "WhatsApp bridge dependencies are missing or stale — run `hermes whatsapp` or use Dashboard setup.",
+                    retryable=False,
+                )
+                return False
 
             # Ensure session directory exists
             self._session_path.mkdir(parents=True, exist_ok=True)

@@ -1,5 +1,7 @@
-import pytest
+import time
 from unittest.mock import AsyncMock
+
+import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
@@ -53,6 +55,28 @@ class _SuccessfulAdapter(BasePlatformAdapter):
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         return True
+
+    async def disconnect(self) -> None:
+        self._mark_disconnected()
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        raise NotImplementedError
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id}
+
+
+class _UnavailableWhatsAppDependenciesAdapter(BasePlatformAdapter):
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True), Platform.WHATSAPP)
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        self._set_fatal_error(
+            "whatsapp_dependencies_unavailable",
+            "WhatsApp bridge dependencies are missing or stale.",
+            retryable=False,
+        )
+        return False
 
     async def disconnect(self) -> None:
         self._mark_disconnected()
@@ -140,6 +164,46 @@ async def test_runner_records_connected_platform_state_on_success(monkeypatch, t
     assert state["platforms"]["discord"]["state"] == "connected"
     assert state["platforms"]["discord"]["error_code"] is None
     assert state["platforms"]["discord"]["error_message"] is None
+
+
+@pytest.mark.asyncio
+async def test_unavailable_whatsapp_dependencies_do_not_block_other_platforms(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = GatewayConfig(
+        platforms={
+            Platform.WHATSAPP: PlatformConfig(enabled=True),
+            Platform.DISCORD: PlatformConfig(enabled=True, token="***"),
+        },
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+
+    def create_adapter(platform, platform_config):
+        if platform == Platform.WHATSAPP:
+            return _UnavailableWhatsAppDependenciesAdapter()
+        return _SuccessfulAdapter()
+
+    monkeypatch.setattr(runner, "_create_adapter", create_adapter)
+    monkeypatch.setattr(runner.hooks, "discover_and_load", lambda: None)
+    monkeypatch.setattr(runner.hooks, "emit", AsyncMock())
+    started = time.monotonic()
+
+    ok = await runner.start()
+
+    assert time.monotonic() - started < 2.0
+    assert ok is True
+    assert runner.should_exit_cleanly is False
+    assert Platform.DISCORD in runner.adapters
+    assert Platform.WHATSAPP not in runner.adapters
+    state = read_runtime_status()
+    assert state["platforms"]["discord"]["state"] == "connected"
+    assert state["platforms"]["whatsapp"]["state"] == "fatal"
+    assert (
+        state["platforms"]["whatsapp"]["error_code"]
+        == "whatsapp_dependencies_unavailable"
+    )
 
 
 @pytest.mark.asyncio

@@ -91,6 +91,7 @@ def test_existing_pairing_skip_branch_enables_whatsapp(isolated_home, monkeypatc
     even if the var was lost since the original pairing.
     """
     from hermes_cli.main import cmd_whatsapp
+    from gateway.platforms import whatsapp_common
 
     # Pre-create a paired session WITHOUT WHATSAPP_ENABLED in .env.
     session = isolated_home / "whatsapp" / "session"
@@ -111,6 +112,11 @@ def test_existing_pairing_skip_branch_enables_whatsapp(isolated_home, monkeypatc
 
     monkeypatch.setattr("builtins.input", fake_input)
     monkeypatch.setattr("hermes_cli.main._require_tty", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        whatsapp_common,
+        "whatsapp_bridge_dependencies_fresh",
+        lambda bridge_dir: True,
+    )
     # Skip the bridge npm install — we're testing setup-ordering, not bridge
     # bootstrapping.  Pretend node_modules exists (Path.exists -> True for that
     # specific check is hard to scope, so instead pretend npm install would
@@ -138,3 +144,34 @@ def test_existing_pairing_skip_branch_enables_whatsapp(isolated_home, monkeypatc
 
     # The skip-rebar branch should have set the env var on its way out.
     assert _env_value(isolated_home, "WHATSAPP_ENABLED") == "true"
+
+
+def test_cli_setup_install_writes_exact_dependency_stamp(isolated_home, monkeypatch, tmp_path):
+    from gateway.platforms import whatsapp_common
+    from hermes_cli.main import cmd_whatsapp
+
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    (bridge / "bridge.js").write_text("// bridge\n")
+    (bridge / "package.json").write_text('{"name":"bridge"}\n')
+    (bridge / "package-lock.json").write_text('{"lockfileVersion":3}\n')
+    session = isolated_home / "whatsapp" / "session"
+    session.mkdir(parents=True)
+    (session / "creds.json").write_text("{}")
+    monkeypatch.setenv("WHATSAPP_MODE", "bot")
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "15551234567")
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    monkeypatch.setattr("hermes_cli.main._require_tty", lambda *_a, **_kw: None)
+    monkeypatch.setattr(whatsapp_common, "resolve_whatsapp_bridge_dir", lambda: bridge)
+    monkeypatch.setattr("hermes_constants.find_node_executable", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr("hermes_constants.with_hermes_node_path", lambda: {})
+
+    def fake_run(*args, **kwargs):
+        (bridge / "node_modules").mkdir()
+        return MagicMock(returncode=0, stderr="")
+
+    monkeypatch.setattr("hermes_cli.main.subprocess.run", fake_run)
+
+    cmd_whatsapp(MagicMock())
+
+    assert whatsapp_common.whatsapp_bridge_dependencies_fresh(bridge) is True
