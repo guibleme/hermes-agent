@@ -18,6 +18,7 @@ def test_hindsight_is_declared():
         "api_url",
         "bank_id",
         "recall_budget",
+        "prefetch_max_tokens",
     }
 
 
@@ -49,3 +50,14 @@ def test_api_key_is_a_secret_bound_to_env():
     assert api_key.kind == KIND_SECRET
     assert api_key.is_secret is True
     assert api_key.env_key == "HINDSIGHT_API_KEY"
+
+
+def test_prefetch_budget_is_declared_as_optional_text():
+    provider = get_provider_config_schema("hindsight")
+    assert provider is not None
+
+    field = next(
+        field for field in provider.fields if field.key == "prefetch_max_tokens"
+    )
+    assert field.kind == "text"
+    assert field.default == ""

@@ -519,9 +519,17 @@ class TestWebServerEndpoints:
         assert resp.status_code == 200
         data = resp.json()
         fields = self._provider_field_map(data)
-        assert set(fields) == {"mode", "api_key", "api_url", "bank_id", "recall_budget"}
+        assert set(fields) == {
+            "mode",
+            "api_key",
+            "api_url",
+            "bank_id",
+            "recall_budget",
+            "prefetch_max_tokens",
+        }
         assert fields["mode"]["kind"] == "select"
         assert fields["api_key"]["kind"] == "secret"
+        assert fields["prefetch_max_tokens"]["kind"] == "text"
 
     def test_declared_surface_hides_undeclared_providers(self):
         resp = self.client.get("/api/memory/providers/builtin/config?surface=declared")
