@@ -237,6 +237,18 @@ class TestProjectFacts:
         assert facts.manifests == ["package.json"]
         assert facts.package_managers == ["pnpm"]
         assert facts.verify_commands == ["pnpm run test"]  # dev excluded
+
+    def test_detects_stdlib_unittest_suite(self, tmp_path):
+        tests_dir = tmp_path / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "test_policy.py").write_text(
+            "import unittest\n",
+            encoding="utf-8",
+        )
+
+        facts = cc.detect_project_facts(tmp_path)
+
+        assert facts.verify_commands == ["python3 -m unittest discover -s tests"]
         assert facts.context_files == []
 
     def test_project_facts_for_matches_prompt_block(self, tmp_path):
