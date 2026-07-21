@@ -169,6 +169,11 @@ VALID_HOOKS: Set[str] = {
     "on_session_end",
     "on_session_finalize",
     "on_session_reset",
+    # Metadata-only result of one context-compression call. Observers may use
+    # this to correlate context pressure with compaction outcomes. Payloads
+    # must contain scalar counts/state only — never messages, summaries,
+    # prompts, focus topics, tool schemas, or error text.
+    "post_context_compression",
     "subagent_start",
     "subagent_stop",
     # Metadata-only application transport observations. These are no-ops

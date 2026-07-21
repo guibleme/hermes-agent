@@ -6138,12 +6138,115 @@ class AIAgent:
         auto-compress abort.  Auto-compress callers use the default
         ``force=False``.
         """
+        import time
+
         from agent.conversation_compression import compress_context
-        return compress_context(
-            self, messages, system_message,
-            approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic,
-            force=force,
+
+        compressor = self.context_compressor
+        message_count_before = len(messages)
+        compression_count_before = int(
+            getattr(compressor, "compression_count", 0) or 0
         )
+        started_at = time.monotonic()
+
+        def observe(
+            status: str,
+            reason_code: str,
+            *,
+            message_count_after: int,
+            error_type: str = "",
+        ) -> None:
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_hook
+
+                payload = {
+                    "session_id": self.session_id or "",
+                    "task_id": task_id,
+                    "platform": getattr(self, "platform", None) or "",
+                    "model": getattr(self, "model", None) or "",
+                    "provider": getattr(self, "provider", None) or "",
+                    "status": status,
+                    "reason_code": reason_code,
+                    "forced": bool(force),
+                    "in_place": bool(getattr(self, "_last_compaction_in_place", False)),
+                    "used_fallback": bool(
+                        getattr(compressor, "_last_summary_fallback_used", False)
+                    ),
+                    "duration_ms": round((time.monotonic() - started_at) * 1000, 3),
+                    "compression_count": int(
+                        getattr(compressor, "compression_count", 0) or 0
+                    ),
+                    "message_count_before": message_count_before,
+                    "message_count_after": message_count_after,
+                    "approx_tokens_before": max(0, int(approx_tokens or 0)),
+                    "rough_tokens_after": max(
+                        0,
+                        int(getattr(compressor, "last_compression_rough_tokens", 0) or 0),
+                    ),
+                    "context_length": max(
+                        0, int(getattr(compressor, "context_length", 0) or 0)
+                    ),
+                    "threshold_tokens": max(
+                        0, int(getattr(compressor, "threshold_tokens", 0) or 0)
+                    ),
+                    "threshold_percent": float(
+                        getattr(compressor, "threshold_percent", 0.0) or 0.0
+                    ),
+                    "compression_savings_pct": float(
+                        getattr(compressor, "_last_compression_savings_pct", 0.0)
+                        or 0.0
+                    ),
+                }
+                if error_type:
+                    payload["error_type"] = error_type
+                _invoke_hook("post_context_compression", **payload)
+            except Exception:
+                pass
+
+        try:
+            result = compress_context(
+                self, messages, system_message,
+                approx_tokens=approx_tokens, task_id=task_id,
+                focus_topic=focus_topic, force=force,
+            )
+        except BaseException as exc:
+            observe(
+                "error",
+                "exception",
+                message_count_after=message_count_before,
+                error_type=type(exc).__name__,
+            )
+            raise
+
+        compression_count_after = int(
+            getattr(compressor, "compression_count", 0) or 0
+        )
+        try:
+            message_count_after = len(result[0])
+        except (IndexError, TypeError):
+            message_count_after = message_count_before
+        if getattr(compressor, "_last_compress_aborted", False):
+            observe(
+                "aborted",
+                "summary_failure",
+                message_count_after=message_count_after,
+            )
+        elif (
+            compression_count_after > compression_count_before
+            or getattr(compressor, "_last_compression_made_progress", False)
+        ):
+            observe(
+                "completed",
+                "compressed",
+                message_count_after=message_count_after,
+            )
+        else:
+            observe(
+                "no_progress",
+                "unchanged",
+                message_count_after=message_count_after,
+            )
+        return result
 
     def _set_tool_guardrail_halt(self, decision: ToolGuardrailDecision) -> None:
         """Record the first guardrail decision that should stop this turn."""
