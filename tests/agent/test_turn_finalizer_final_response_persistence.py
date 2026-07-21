@@ -114,6 +114,42 @@ def test_finalizer_restores_clean_api_local_text_before_return(monkeypatch):
     assert result["messages"][0]["content"] == "clean prompt"
 
 
+def test_post_llm_hook_receives_content_free_turn_outcome(monkeypatch):
+    captured = {}
+
+    def invoke(name, **kwargs):
+        if name == "post_llm_call":
+            captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke)
+    agent = FakeAgent()
+    agent._turn_file_mutation_paths = {"/workspace/b.py", "/workspace/a.py"}
+    messages = [
+        {"role": "user", "content": "fix it"},
+        {"role": "assistant", "content": "Done."},
+    ]
+
+    finalize_turn(
+        agent,
+        final_response="Done.",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="fix it",
+        original_user_message="fix it",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert captured["changed_paths"] == ["/workspace/a.py", "/workspace/b.py"]
+    assert captured["turn_exit_reason"] == "text_response(finish_reason=stop)"
+
+
 def test_finalizer_restores_clean_api_local_multimodal_before_return(monkeypatch):
     """A queued note does not remain in the next-turn native image payload."""
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])

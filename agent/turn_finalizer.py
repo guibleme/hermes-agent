@@ -491,6 +491,10 @@ def finalize_turn(
                 conversation_history=list(messages),
                 model=agent.model,
                 platform=getattr(agent, "platform", None) or "",
+                changed_paths=sorted(
+                    getattr(agent, "_turn_file_mutation_paths", set()) or []
+                ),
+                turn_exit_reason=str(_turn_exit_reason or ""),
             )
         except Exception as exc:
             logger.warning("post_llm_call hook failed: %s", exc)
