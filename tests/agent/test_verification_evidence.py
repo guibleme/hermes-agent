@@ -131,6 +131,28 @@ def test_classifies_python_module_pytest_as_detected_pytest(tmp_path, monkeypatc
     assert evidence.status == "failed"
 
 
+def test_classifies_stdlib_unittest_discovery(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _git_project(tmp_path)
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_policy.py").write_text("import unittest\n", encoding="utf-8")
+
+    evidence = classify_verification_command(
+        "python3 -m unittest discover -s tests -v",
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+        output="OK",
+    )
+
+    assert evidence is not None
+    assert evidence.canonical_command == "python3 -m unittest discover -s tests"
+    assert evidence.kind == "test"
+    assert evidence.scope == "full"
+    assert evidence.status == "passed"
+
+
 def test_records_passed_then_marks_stale_after_edit(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     _node_project(tmp_path)

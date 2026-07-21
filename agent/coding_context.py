@@ -777,6 +777,17 @@ def detect_project_facts(root: Path) -> ProjectFacts:
         verify.extend(f"{js_pm} run {name}" for name in _VERIFY_TARGETS if name in scripts)
     if (root / "pytest.ini").is_file() or "[tool.pytest" in _read_small(root / "pyproject.toml"):
         verify.append("pytest")
+    tests_dir = root / "tests"
+    if tests_dir.is_dir():
+        try:
+            has_unittest_files = any(
+                path.is_file() and path.name.startswith("test") and path.suffix == ".py"
+                for path in tests_dir.iterdir()
+            )
+        except OSError:
+            has_unittest_files = False
+        if has_unittest_files and "pytest" not in verify:
+            verify.append("python3 -m unittest discover -s tests")
     makefile = _read_small(root / "Makefile")
     if makefile:
         verify.extend(
