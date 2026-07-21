@@ -1020,7 +1020,7 @@ def my_callback(event, gateway, session_store, **kwargs):
 |--------|--------|
 | `{"action": "skip", "reason": "..."}` | Drop the message — no agent reply, no pairing flow, no auth. Plugin is assumed to have handled it (e.g. silent-ingested into the transcript). |
 | `{"action": "rewrite", "text": "new text"}` | Replace `event.text`, then continue normal dispatch with the modified event. Useful for collapsing buffered ambient messages into a single prompt. |
-| `{"action": "allow"}` / `None` | Normal dispatch — runs the full auth / pairing / agent-loop chain. |
+| `{"action": "allow"}` / `None` | Normal dispatch — runs the full auth / pairing / agent-loop chain. An `allow` result may include `session_model_override` with `model` and optionally `provider`; Hermes strips other keys and applies a valid proposal only after authorization and final session resolution, at the start of a fresh conversation. Existing explicit session or channel model overrides win. Plugins cannot propose a custom `base_url`. |
 
 **Use cases:** Listen-only group chats (only respond when tagged; buffer ambient messages into context); human handover (silent-ingest customer messages while owner handles the chat manually); per-profile rate limiting; policy-driven routing.
 

@@ -177,6 +177,10 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "skip",    "reason": "..."}  -> drop message (no reply)
     #   {"action": "rewrite", "text": "..."}    -> replace event.text, continue
     #   {"action": "allow"}  /  None             -> normal dispatch
+    # An ``allow`` result may include ``session_model_override`` with the
+    # non-secret keys model/provider. The gateway defers application
+    # until authorization and final session resolution, and only applies it at
+    # a fresh conversation boundary.
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous

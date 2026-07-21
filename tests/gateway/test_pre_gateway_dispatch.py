@@ -133,6 +133,72 @@ async def test_hook_allow_falls_through_to_auth(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_hook_model_proposal_is_sanitized_and_deferred_until_after_auth(monkeypatch):
+    """Model proposals cross auth only as non-secret event metadata."""
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    captured = {}
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [{
+                "action": "allow",
+                "session_model_override": {
+                    "model": "heavy-model",
+                    "provider": "test-provider",
+                    "api_key": "must-not-cross-boundary",
+                },
+            }]
+        return []
+
+    async def _capture(event, source, _quick_key, _run_generation):
+        captured.update(event.metadata)
+        return "ok"
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = _capture  # noqa: SLF001
+
+    await runner._handle_message(_make_event("route this"))
+
+    assert captured["_hermes_session_model_override"] == {
+        "model": "heavy-model",
+        "provider": "test-provider",
+    }
+    assert "must-not-cross-boundary" not in repr(captured)
+
+
+@pytest.mark.asyncio
+async def test_hook_model_proposal_cannot_mutate_an_unauthorized_session(monkeypatch):
+    """A pre-auth proposal never reaches the session handler when auth fails."""
+    _clear_auth_env(monkeypatch)
+    reached_session_handler = False
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [{
+                "action": "allow",
+                "session_model_override": {"model": "heavy-model"},
+            }]
+        return []
+
+    async def _capture(*_args, **_kwargs):
+        nonlocal reached_session_handler
+        reached_session_handler = True
+        return "ok"
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = _capture  # noqa: SLF001
+    runner.pairing_store.generate_code.return_value = "12345"
+
+    await runner._handle_message(_make_event("route this"))
+
+    assert reached_session_handler is False
+    runner.pairing_store.generate_code.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_hook_exception_does_not_break_dispatch(monkeypatch):
     """A raising plugin hook does not break the gateway."""
     _clear_auth_env(monkeypatch)

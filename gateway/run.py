@@ -1919,6 +1919,7 @@ from gateway.session import (
     build_session_key,
     is_shared_multi_user_session,
     neutralize_untrusted_inline_text,
+    sanitize_model_override,
 )
 from gateway.delivery import DeliveryRouter, looks_like_telegram_private_chat_id
 from gateway.turn_lease import SessionTurnLeaseRegistry
@@ -2708,6 +2709,25 @@ def _get_channel_override(
         if ov is not None:
             return ov
     return None
+
+
+def _sanitize_session_model_proposal(value: Any) -> Optional[Dict[str, str]]:
+    """Accept only configured model/provider identities from plugin output.
+
+    The broader manual ``/model`` persistence contract also permits
+    ``base_url``. A pre-dispatch plugin must not gain authority to redirect
+    resolved credentials to an arbitrary endpoint, so proposals deliberately
+    expose a narrower surface.
+    """
+    cleaned = sanitize_model_override(value)
+    if not cleaned:
+        return None
+    proposal = {
+        key: cleaned[key]
+        for key in ("model", "provider")
+        if key in cleaned
+    }
+    return proposal if proposal.get("model") else None
 
 
 def _resolve_hermes_bin() -> Optional[list[str]]:
@@ -10030,6 +10050,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         #   {"action": "skip",    "reason": ...}    -> drop (no reply, plugin handled)
         #   {"action": "rewrite", "text":  ...}     -> replace event.text, continue
         #   {"action": "allow"}   /   None          -> normal dispatch
+        # An ``allow`` result may also carry a non-secret
+        # ``session_model_override`` proposal.  It is staged on the event here,
+        # then validated and applied only after auth and final session routing.
         # Hook runs BEFORE auth so plugins can handle unauthorized senders
         # (e.g. customer handover ingest) without triggering the pairing flow.
         if not is_internal:
@@ -10064,6 +10087,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         source = event.source
                     break
                 if _action == "allow":
+                    _proposal = _sanitize_session_model_proposal(
+                        _result.get("session_model_override")
+                    )
+                    if _proposal:
+                        event.metadata = dict(event.metadata or {})
+                        event.metadata["_hermes_session_model_override"] = _proposal
                     break
 
         if is_internal:
@@ -11982,6 +12011,77 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    async def _apply_proposed_session_model_override(
+        self,
+        *,
+        event: Any,
+        source: SessionSource,
+        session_entry: Any,
+        is_new_session: bool,
+    ) -> bool:
+        """Pin a plugin-proposed model at a real conversation boundary.
+
+        ``pre_gateway_dispatch`` runs before authorization and before Telegram
+        topic recovery, so it may only *stage* a proposal on the event.  This
+        method runs after both boundaries are complete.  Explicit session and
+        channel overrides retain priority, and only the existing non-secret
+        override contract is persisted.
+        """
+        metadata = getattr(event, "metadata", None)
+        raw_proposal = (
+            metadata.pop("_hermes_session_model_override", None)
+            if isinstance(metadata, dict)
+            else None
+        )
+        proposal = _sanitize_session_model_proposal(raw_proposal)
+        if not is_new_session or not proposal:
+            return False
+
+        session_key = str(getattr(session_entry, "session_key", "") or "")
+        if not session_key:
+            return False
+
+        persisted_override = getattr(session_entry, "model_override", None)
+        in_memory_override = getattr(self, "_session_model_overrides", {}).get(
+            session_key
+        )
+        if persisted_override or in_memory_override:
+            logger.info(
+                "Session model proposal ignored: session=%s policy=explicit_session_override",
+                session_key,
+            )
+            return False
+
+        cfg = getattr(self, "config", None)
+        if cfg is not None:
+            channel_override = _get_channel_override(
+                cfg,
+                source.platform,
+                str(source.chat_id or ""),
+                thread_id=str(source.thread_id) if source.thread_id else None,
+                parent_id=str(source.parent_chat_id) if source.parent_chat_id else None,
+            )
+            if channel_override and (
+                channel_override.model or channel_override.provider
+            ):
+                logger.info(
+                    "Session model proposal ignored: session=%s policy=explicit_channel_override",
+                    session_key,
+                )
+                return False
+
+        await self.async_session_store.set_model_override(session_key, proposal)
+        # Rehydrate through the normal provider resolver on first use.  Keeping
+        # credentials out of this path is the point of the persisted override
+        # contract; no API key is accepted from plugin output.
+        logger.info(
+            "Session model proposal pinned: session=%s model=%s provider=%s policy=conversation_boundary",
+            session_key,
+            proposal["model"],
+            proposal.get("provider"),
+        )
+        return True
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -12142,6 +12242,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # onto subsequent messages in the same session (issue #6508).
         if getattr(session_entry, "is_fresh_reset", False):
             session_entry.is_fresh_reset = False
+        await self._apply_proposed_session_model_override(
+            event=event,
+            source=source,
+            session_entry=session_entry,
+            is_new_session=_is_new_session,
+        )
         if _is_new_session:
             await self.hooks.emit("session:start", {
                 "platform": source.platform.value if source.platform else "",
