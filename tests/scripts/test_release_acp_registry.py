@@ -1,11 +1,9 @@
-"""Tests for the ACP Registry version-lockstep bump in scripts/release.py.
+"""Tests for atomic release-version ownership in scripts/release.py.
 
-The official ACP Registry manifest must match ``pyproject.toml`` exactly —
-``tests/acp/test_registry_manifest.py`` enforces this at lint time, and the
-upstream registry CI rejects ``@latest`` / floating pins. The release script
-is the single place that bumps the manifest in lockstep with pyproject; if
-that bump ever silently breaks, weekly releases fail the manifest test
-until someone hand-edits the JSON.
+The Python package, Desktop package metadata and workspace lock, and official
+ACP Registry manifest must move together. The release script is their single
+owner; if it silently misses one, packaged identity or registry pins drift from
+the release users believe they installed.
 """
 
 from __future__ import annotations
@@ -13,6 +11,8 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+
+import pytest
 
 
 def _load_release_module(monkeypatch, tmp_root: Path):
@@ -96,6 +96,27 @@ def test_update_version_files_bumps_manifest_alongside_pyproject(
         '__version__ = "0.13.0"\n__release_date__ = "2026-05-14"\n',
         encoding="utf-8",
     )
+    desktop_dir = tmp_path / "apps" / "desktop"
+    desktop_dir.mkdir(parents=True)
+    (desktop_dir / "package.json").write_text(
+        json.dumps({"name": "hermes", "version": "0.13.0"}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "package-lock.json").write_text(
+        json.dumps(
+            {
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {"name": "hermes-agent", "version": "1.0.0"},
+                    "apps/desktop": {"name": "hermes", "version": "0.13.0"},
+                    "node_modules/example": {"version": "0.13.0"},
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     module = _load_release_module(monkeypatch, tmp_path)
     monkeypatch.setattr(module, "VERSION_FILE", version_dir / "__init__.py")
@@ -106,8 +127,61 @@ def test_update_version_files_bumps_manifest_alongside_pyproject(
     pyproject_text = (tmp_path / "pyproject.toml").read_text(encoding="utf-8")
     assert 'version = "0.14.0"' in pyproject_text
 
+    desktop_package = json.loads(
+        (desktop_dir / "package.json").read_text(encoding="utf-8")
+    )
+    lock_data = json.loads(
+        (tmp_path / "package-lock.json").read_text(encoding="utf-8")
+    )
+    assert desktop_package["version"] == "0.14.0"
+    assert lock_data["packages"]["apps/desktop"]["version"] == "0.14.0"
+    assert lock_data["packages"][""]["version"] == "1.0.0"
+    assert lock_data["packages"]["node_modules/example"]["version"] == "0.13.0"
+
     manifest = json.loads(
         (tmp_path / "acp_registry" / "agent.json").read_text(encoding="utf-8")
     )
     assert manifest["version"] == "0.14.0"
     assert manifest["distribution"]["uvx"]["package"] == "hermes-agent[acp]==0.14.0"
+
+    owned_files = set(module.version_files_for_release())
+    assert owned_files == {
+        version_dir / "__init__.py",
+        tmp_path / "pyproject.toml",
+        desktop_dir / "package.json",
+        tmp_path / "package-lock.json",
+        tmp_path / "acp_registry" / "agent.json",
+    }
+
+
+def test_update_version_files_rejects_missing_desktop_lock_entry(
+    monkeypatch, tmp_path
+):
+    """A present workspace lock must not silently omit packaged Desktop."""
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nversion = "0.13.0"\n', encoding="utf-8"
+    )
+    version_dir = tmp_path / "hermes_cli"
+    version_dir.mkdir()
+    (version_dir / "__init__.py").write_text(
+        '__version__ = "0.13.0"\n__release_date__ = "2026-05-14"\n',
+        encoding="utf-8",
+    )
+    desktop_dir = tmp_path / "apps" / "desktop"
+    desktop_dir.mkdir(parents=True)
+    (desktop_dir / "package.json").write_text(
+        '{"name":"hermes","version":"0.13.0"}\n', encoding="utf-8"
+    )
+    (tmp_path / "package-lock.json").write_text(
+        '{"lockfileVersion":3,"packages":{}}\n', encoding="utf-8"
+    )
+
+    module = _load_release_module(monkeypatch, tmp_path)
+    monkeypatch.setattr(module, "VERSION_FILE", version_dir / "__init__.py")
+    monkeypatch.setattr(module, "PYPROJECT_FILE", tmp_path / "pyproject.toml")
+
+    with pytest.raises(
+        ValueError,
+        match="package-lock.json is missing the apps/desktop workspace entry",
+    ):
+        module.update_version_files("0.14.0", "2026-05-21")

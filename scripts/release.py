@@ -2203,9 +2203,38 @@ def update_version_files(semver: str, calver_date: str):
         )
         desktop_pkg.write_text(pkg_text, encoding="utf-8")
 
+        # The root npm lock owns the workspace package metadata. Keep that
+        # exact workspace entry aligned too, or npm rewrites the lock and
+        # electron-builder packages a different version than the release.
+        npm_lock = REPO_ROOT / "package-lock.json"
+        if npm_lock.exists():
+            lock_data = json.loads(npm_lock.read_text(encoding="utf-8"))
+            desktop_lock = lock_data.get("packages", {}).get("apps/desktop")
+            if not isinstance(desktop_lock, dict):
+                raise ValueError(
+                    "package-lock.json is missing the apps/desktop workspace entry"
+                )
+            desktop_lock["version"] = semver
+            npm_lock.write_text(
+                json.dumps(lock_data, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
     # Update ACP Registry manifest + npm launcher (must stay version-locked
     # with pyproject — enforced by tests/acp/test_registry_manifest.py).
     _update_acp_registry_versions(semver)
+
+
+def version_files_for_release() -> list[Path]:
+    """Return every existing file owned by an atomic release-version bump."""
+    candidates = (
+        VERSION_FILE,
+        PYPROJECT_FILE,
+        REPO_ROOT / "apps" / "desktop" / "package.json",
+        REPO_ROOT / "package-lock.json",
+        ACP_REGISTRY_MANIFEST,
+    )
+    return [path for path in candidates if path.exists()]
 
 
 def _update_acp_registry_versions(semver: str) -> None:
@@ -2605,9 +2634,7 @@ def main():
             print(f"  ✓ Updated version files to v{new_version} ({calver_date})")
 
             # Commit version bump
-            add_files = [str(VERSION_FILE), str(PYPROJECT_FILE)]
-            if ACP_REGISTRY_MANIFEST.exists():
-                add_files.append(str(ACP_REGISTRY_MANIFEST))
+            add_files = [str(path) for path in version_files_for_release()]
             add_result = git_result("add", *add_files)
             if add_result.returncode != 0:
                 print(f"  ✗ Failed to stage version files: {add_result.stderr.strip()}")
