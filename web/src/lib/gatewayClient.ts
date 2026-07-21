@@ -31,6 +31,7 @@ export class GatewayClient extends JsonRpcGatewayClient {
       closedErrorMessage: "WebSocket closed",
       connectErrorMessage: "WebSocket connection failed",
       notConnectedErrorMessage: "gateway not connected",
+      observerSurface: "dashboard",
       requestIdPrefix: "w",
     });
   }

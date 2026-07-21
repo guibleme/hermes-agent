@@ -171,6 +171,12 @@ VALID_HOOKS: Set[str] = {
     "on_session_reset",
     "subagent_start",
     "subagent_stop",
+    # Metadata-only application transport observations. These are no-ops
+    # unless an explicitly enabled plugin registers a listener. Callers must
+    # never include prompts, params, results, URLs, peer addresses, or error
+    # messages in these hook payloads.
+    "gateway_connection",
+    "gateway_rpc",
     # Gateway pre-dispatch hook. Fired once per incoming MessageEvent
     # after the internal-event guard but BEFORE auth/pairing and agent
     # dispatch. Plugins may return a dict to influence flow:

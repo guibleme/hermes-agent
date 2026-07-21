@@ -29,6 +29,7 @@ import json
 import logging
 import socket
 import threading
+import time
 from typing import Any
 
 from tui_gateway import server
@@ -89,10 +90,12 @@ class WSTransport:
         loop: asyncio.AbstractEventLoop,
         *,
         peer: str = "unknown",
+        observer_surface: str = "unknown",
     ) -> None:
         self._ws = ws
         self._loop = loop
         self._peer = peer
+        self.observer_surface = observer_surface
         self._closed = False
         # Token-coalescing buffer (CF-2). Streamed token frames land here and a
         # short timer flushes the batch. The lock guards the buffer + the
@@ -262,6 +265,17 @@ def _ws_peer_label(ws: Any) -> str:
     return f"{host}:{port}" if port is not None else host
 
 
+def _ws_observer_surface(ws: Any) -> str:
+    try:
+        raw = str((getattr(ws, "query_params", None) or {}).get("surface") or "")
+    except Exception:
+        raw = ""
+    normalized = raw.strip().lower()
+    if normalized in {"dashboard", "desktop"}:
+        return normalized
+    return server._resolve_session_platform()
+
+
 def _disable_nagle(ws: Any) -> None:
     """Disable Nagle so streamed JSON-RPC frames go out individually.
 
@@ -289,6 +303,8 @@ async def handle_ws(ws: Any) -> None:
     dispatch_crashes = 0
     send_failures = 0
     disconnect_reason = "not_connected"
+    connected_at = time.monotonic()
+    observer_surface = _ws_observer_surface(ws)
 
     try:
         await ws.accept()
@@ -298,7 +314,18 @@ async def handle_ws(ws: Any) -> None:
         _disable_nagle(ws)
         _log.info("ws accepted peer=%s", peer)
 
-        transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer)
+        await asyncio.to_thread(
+            server.observe_gateway_connection,
+            surface=observer_surface,
+            status="open",
+        )
+
+        transport = WSTransport(
+            ws,
+            asyncio.get_running_loop(),
+            peer=peer,
+            observer_surface=observer_surface,
+        )
 
         # The desktop app and dashboard chat reach the agent through this WS
         # sidecar, NOT through tui_gateway.entry.main() (the stdio TUI path that
@@ -452,6 +479,17 @@ async def handle_ws(ws: Any) -> None:
             await ws.close()
         except Exception as exc:
             _log.debug("ws close failed peer=%s error=%s", peer, exc)
+        await asyncio.to_thread(
+            server.observe_gateway_connection,
+            surface=observer_surface,
+            status="closed",
+            duration_ms=(time.monotonic() - connected_at) * 1000,
+            reason_code=disconnect_reason.partition("(")[0],
+            message_count=messages,
+            parse_errors=parse_errors,
+            dispatch_crashes=dispatch_crashes,
+            send_failures=send_failures,
+        )
         _log.info(
             "ws closed peer=%s reason=%s messages=%d parse_errors=%d "
             "dispatch_crashes=%d send_failures=%d reaped_sessions=%d detached_sessions=%d",

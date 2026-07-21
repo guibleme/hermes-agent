@@ -1496,6 +1496,94 @@ def handle_request(req: dict) -> dict | None:
     return fn(rid, params)
 
 
+def _rpc_observer_surface(transport: Transport) -> str:
+    raw = str(getattr(transport, "observer_surface", "") or "").strip().lower()
+    if raw in {"dashboard", "desktop", "tui"}:
+        return raw
+    return _resolve_session_platform()
+
+
+def _rpc_session_id(params: Any) -> str | None:
+    if not isinstance(params, dict):
+        return None
+    value = params.get("session_id")
+    if not isinstance(value, str) or not 1 <= len(value) <= 128:
+        return None
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-"
+    return value if all(char in allowed for char in value) else None
+
+
+def _observe_rpc_result(
+    *,
+    request: Any,
+    response: Any,
+    started_at: float,
+    transport: Transport,
+) -> None:
+    """Emit a strict metadata-only RPC completion summary, fail-open."""
+    raw_method = request.get("method") if isinstance(request, dict) else None
+    method = raw_method if isinstance(raw_method, str) and raw_method in _methods else "unknown"
+    params = request.get("params") if isinstance(request, dict) else None
+    error = response.get("error") if isinstance(response, dict) else None
+    status = "error" if isinstance(error, dict) else "ok"
+    error_code = error.get("code") if isinstance(error, dict) else None
+    error_type = f"rpc_{error_code}" if isinstance(error_code, int) else None
+    surface = _rpc_observer_surface(transport)
+    platform = surface if surface in {"dashboard", "desktop"} else _resolve_session_platform()
+    payload = {
+        "platform": platform,
+        "surface": surface,
+        "rpc_method": method,
+        "session_id": _rpc_session_id(params),
+        "status": status,
+        "error_type": error_type,
+        "duration_ms": round(max(0.0, time.monotonic() - started_at) * 1000, 3),
+    }
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        invoke_hook("gateway_rpc", **payload)
+    except Exception as exc:
+        logger.debug("gateway RPC observation failed: %s", type(exc).__name__)
+
+
+def observe_gateway_connection(
+    *,
+    surface: str,
+    status: str,
+    duration_ms: float = 0.0,
+    reason_code: str | None = None,
+    message_count: int = 0,
+    parse_errors: int = 0,
+    dispatch_crashes: int = 0,
+    send_failures: int = 0,
+) -> None:
+    """Emit a strict metadata-only WebSocket lifecycle summary, fail-open."""
+    normalized_surface = surface if surface in {"dashboard", "desktop", "tui"} else "unknown"
+    platform = (
+        normalized_surface
+        if normalized_surface in {"dashboard", "desktop"}
+        else _resolve_session_platform()
+    )
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        invoke_hook(
+            "gateway_connection",
+            platform=platform,
+            surface=normalized_surface,
+            status=status,
+            reason_code=reason_code,
+            duration_ms=round(max(0.0, duration_ms), 3),
+            message_count=max(0, int(message_count)),
+            parse_errors=max(0, int(parse_errors)),
+            dispatch_crashes=max(0, int(dispatch_crashes)),
+            send_failures=max(0, int(send_failures)),
+        )
+    except Exception as exc:
+        logger.debug("gateway connection observation failed: %s", type(exc).__name__)
+
+
 def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
     """Route inbound RPCs — long handlers to the pool, everything else inline.
 
@@ -1509,15 +1597,29 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
     the original behaviour for ``tui_gateway.entry``.
     """
     t = transport or _stdio_transport
+    started_at = time.monotonic()
     token = bind_transport(t)
     try:
         normalized = _normalize_request(req)
         if isinstance(normalized, dict):
+            _observe_rpc_result(
+                request=req,
+                response=normalized,
+                started_at=started_at,
+                transport=t,
+            )
             return normalized
 
         _rid, method, _params = normalized
         if method not in _LONG_HANDLERS:
-            return handle_request(req)
+            response = handle_request(req)
+            _observe_rpc_result(
+                request=req,
+                response=response,
+                started_at=started_at,
+                transport=t,
+            )
+            return response
 
         # Snapshot the context so the pool worker sees the bound transport.
         ctx = contextvars.copy_context()
@@ -1527,6 +1629,12 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
                 resp = handle_request(req)
             except Exception as exc:
                 resp = _err(req.get("id"), -32000, f"handler error: {exc}")
+            _observe_rpc_result(
+                request=req,
+                response=resp,
+                started_at=started_at,
+                transport=t,
+            )
             if resp is not None:
                 t.write(resp)
 

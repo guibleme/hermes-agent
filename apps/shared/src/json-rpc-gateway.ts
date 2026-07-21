@@ -32,6 +32,7 @@ export interface GatewayEvent<P = unknown> {
 
 export type ConnectionState = 'idle' | 'connecting' | 'open' | 'closed' | 'error'
 export type GatewayRequestId = number | string
+export type GatewayObserverSurface = 'dashboard' | 'desktop'
 
 export interface JsonRpcFrame {
   error?: { message?: string }
@@ -54,6 +55,7 @@ export interface GatewayClientOptions {
   connectErrorMessage?: string
   connectTimeoutMs?: number
   createRequestId?: (nextId: number) => GatewayRequestId
+  observerSurface?: GatewayObserverSurface
   requestIdPrefix?: string
   requestTimeoutMs?: number
   socketFactory?: (url: string) => WebSocketLike
@@ -74,8 +76,8 @@ export class JsonRpcGatewayClient {
   private state: ConnectionState = 'idle'
   private readonly eventHandlers = new Map<string, Set<(event: GatewayEvent) => void>>()
   private readonly stateHandlers = new Set<(state: ConnectionState) => void>()
-  private readonly options: Required<Omit<GatewayClientOptions, 'socketFactory'>> &
-    Pick<GatewayClientOptions, 'socketFactory'>
+  private readonly options: Required<Omit<GatewayClientOptions, 'observerSurface' | 'socketFactory'>> &
+    Pick<GatewayClientOptions, 'observerSurface' | 'socketFactory'>
 
   constructor(options: GatewayClientOptions = {}) {
     this.options = {
@@ -84,6 +86,7 @@ export class JsonRpcGatewayClient {
       connectTimeoutMs: options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
       createRequestId: options.createRequestId ?? ((nextId: number) => `${options.requestIdPrefix ?? 'r'}${nextId}`),
       notConnectedErrorMessage: options.notConnectedErrorMessage ?? 'gateway not connected',
+      observerSurface: options.observerSurface,
       requestIdPrefix: options.requestIdPrefix ?? 'r',
       requestTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
       socketFactory: options.socketFactory
@@ -101,7 +104,8 @@ export class JsonRpcGatewayClient {
 
     this.setState('connecting')
 
-    const socket = this.options.socketFactory?.(wsUrl) ?? new WebSocket(wsUrl)
+    const observedUrl = this.options.observerSurface ? withObserverSurface(wsUrl, this.options.observerSurface) : wsUrl
+    const socket = this.options.socketFactory?.(observedUrl) ?? new WebSocket(observedUrl)
     this.socket = socket
 
     socket.addEventListener('message', message => {
@@ -391,4 +395,10 @@ export class JsonRpcGatewayClient {
       handler(state)
     }
   }
+}
+
+function withObserverSurface(wsUrl: string, surface: GatewayObserverSurface): string {
+  const url = new URL(wsUrl)
+  url.searchParams.set('surface', surface)
+  return url.toString()
 }
