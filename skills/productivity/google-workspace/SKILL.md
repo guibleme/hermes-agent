@@ -62,11 +62,12 @@ Calendar/Drive/Sheets/Docs?"**
   Load the himalaya skill and follow its setup instructions.
 
 - **Email + Calendar** → Continue with this skill, but use
-  `--services email,calendar` during auth so the consent screen only asks for
-  the scopes they actually need.
+  `--services email,calendar --access readonly` during auth so the consent
+  screen only asks for the scopes they actually need.
 
 - **Calendar/Drive/Sheets/Docs only** → Continue with this skill and use a
-  narrower `--services` set like `calendar,drive,sheets,docs`.
+  narrower read-only set like
+  `--services calendar,drive,sheets,docs --access readonly`.
 
 - **Full Workspace access** → Continue with this skill and use the default
   `all` service set.
@@ -119,9 +120,9 @@ explicit (for example `~/Downloads/hermes-google-client-secret.json`), then run
 Use the service set chosen in Step 1. Examples:
 
 ```bash
-$GSETUP --auth-url --services email,calendar --format json
-$GSETUP --auth-url --services calendar,drive,sheets,docs --format json
-$GSETUP --auth-url --services all --format json
+$GSETUP --auth-url --services email,calendar --access readonly --format json
+$GSETUP --auth-url --services calendar,drive,sheets,docs --access readonly --format json
+$GSETUP --auth-url --services all --access readwrite --format json
 ```
 
 This returns JSON with an `auth_url` field and also saves the exact URL to
