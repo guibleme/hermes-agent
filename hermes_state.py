@@ -1152,6 +1152,21 @@ CREATE TABLE IF NOT EXISTS state_meta (
     value TEXT
 );
 
+CREATE TABLE IF NOT EXISTS operation_receipts (
+    operation_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    session_key TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL,
+    claim_token TEXT,
+    owner_boot_id TEXT,
+    result_json TEXT,
+    error_json TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    completed_at REAL
+);
+
 CREATE TABLE IF NOT EXISTS gateway_routing (
     scope TEXT NOT NULL DEFAULT '',
     session_key TEXT NOT NULL,
@@ -1193,6 +1208,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_operation_receipts_session
+    ON operation_receipts(session_key, created_at);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
@@ -3355,6 +3372,139 @@ class SessionDB:
                     self._ensure_fts_cjk_schema(cursor)
 
         self._conn.commit()
+
+    # =========================================================================
+    # Client mutation receipts
+    # =========================================================================
+
+    @staticmethod
+    def _operation_receipt_row(row: sqlite3.Row) -> Dict[str, Any]:
+        receipt = dict(row)
+        for key in ("result_json", "error_json"):
+            raw = receipt.pop(key, None)
+            if raw:
+                try:
+                    receipt[key.removesuffix("_json")] = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    receipt[key.removesuffix("_json")] = None
+            else:
+                receipt[key.removesuffix("_json")] = None
+        return receipt
+
+    def get_operation_receipt(self, operation_id: str) -> Optional[Dict[str, Any]]:
+        """Return one durable client-mutation receipt, if present."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM operation_receipts WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+        return self._operation_receipt_row(row) if row is not None else None
+
+    def claim_operation_receipt(
+        self,
+        operation_id: str,
+        *,
+        kind: str,
+        request_hash: str,
+        session_key: str,
+        state: str,
+        claim_token: str,
+        owner_boot_id: str,
+        result: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """Atomically claim a content-bound client mutation.
+
+        Returns ``(created, receipt)``. Concurrent callers sharing one SQLite
+        file serialize through ``BEGIN IMMEDIATE``; only the INSERT winner may
+        authorize the mutation. Callers must compare ``kind`` and
+        ``request_hash`` before treating an existing row as a replay.
+        """
+        now = time.time()
+        result_json = (
+            json.dumps(result, sort_keys=True, separators=(",", ":"))
+            if result is not None
+            else None
+        )
+
+        def _do(conn):
+            cursor = conn.execute(
+                """INSERT INTO operation_receipts (
+                       operation_id, kind, request_hash, session_key, state,
+                       claim_token, owner_boot_id, result_json,
+                       created_at, updated_at
+                   )
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(operation_id) DO NOTHING""",
+                (
+                    operation_id,
+                    kind,
+                    request_hash,
+                    session_key,
+                    state,
+                    claim_token,
+                    owner_boot_id,
+                    result_json,
+                    now,
+                    now,
+                ),
+            )
+            created = cursor.rowcount == 1
+            row = conn.execute(
+                "SELECT * FROM operation_receipts WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            return created, row
+
+        created, row = self._execute_write(_do)
+        return created, self._operation_receipt_row(row)
+
+    def finish_operation_receipt(
+        self,
+        operation_id: str,
+        *,
+        claim_token: str,
+        state: str,
+        result: Optional[Dict[str, Any]] = None,
+        error: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """CAS a claimed receipt into a terminal state.
+
+        The claim-token and ``creating``/``running`` guard prevent stale
+        workers from overwriting another outcome.
+        """
+        now = time.time()
+        result_json = (
+            json.dumps(result, sort_keys=True, separators=(",", ":"))
+            if result is not None
+            else None
+        )
+        error_json = (
+            json.dumps(error, sort_keys=True, separators=(",", ":"))
+            if error is not None
+            else None
+        )
+
+        def _do(conn):
+            cursor = conn.execute(
+                """UPDATE operation_receipts
+                   SET state = ?, result_json = ?, error_json = ?,
+                       updated_at = ?, completed_at = ?
+                   WHERE operation_id = ?
+                     AND claim_token = ?
+                     AND state IN ('creating', 'running')""",
+                (
+                    state,
+                    result_json,
+                    error_json,
+                    now,
+                    now,
+                    operation_id,
+                    claim_token,
+                ),
+            )
+            return cursor.rowcount == 1
+
+        return bool(self._execute_write(_do))
 
     # =========================================================================
     # Session lifecycle

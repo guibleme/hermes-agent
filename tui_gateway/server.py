@@ -141,6 +141,7 @@ _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
 _session_resume_lock = threading.Lock()
+_gateway_boot_id = uuid.uuid4().hex
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
@@ -4083,6 +4084,12 @@ def _current_profile_name() -> str:
 # v4: session.create fast=false is an explicit per-session normal-tier override.
 DESKTOP_BACKEND_CONTRACT = 4
 
+# Optional durable mutation-receipt contract. This is intentionally separate
+# from DESKTOP_BACKEND_CONTRACT: legacy Hermes Desktop/TUI clients do not need
+# to send idempotency keys, while clients that understand v1 can negotiate
+# content-bound at-most-once acceptance for session.create and prompt.submit.
+MUTATION_RECEIPT_CONTRACT = 1
+
 
 def _session_usage_snapshot(session: dict | None) -> dict:
     agent = (session or {}).get("agent")
@@ -4184,6 +4191,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "title": _session_live_title(session or {}, session_key) if session_key else "",
         "stored_session_id": session_key or "",
         "desktop_contract": DESKTOP_BACKEND_CONTRACT,
+        "mutation_receipt_contract": MUTATION_RECEIPT_CONTRACT,
         "version": "",
         "release_date": "",
         "update_behind": None,
@@ -6259,11 +6267,108 @@ def _queued_prompt_snapshot(session: dict) -> dict | None:
     return {"user": user} if user else None
 
 
+def _idempotency_key(params: dict) -> tuple[str, str | None]:
+    raw = params.get("idempotency_key")
+    if raw is None:
+        return "", None
+    key = str(raw).strip()
+    valid = (
+        16 <= len(key) <= 128
+        and all(
+            char.isascii() and (char.isalnum() or char in "._:-")
+            for char in key
+        )
+    )
+    if not valid:
+        return "", (
+            "idempotency_key must be 16-128 ASCII letters, digits, '.', '_', "
+            "':' or '-'"
+        )
+    return key, None
+
+
+def _operation_request_hash(kind: str, payload: dict) -> str:
+    canonical = json.dumps(
+        {"kind": kind, "request": payload},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _operation_receipt_projection(receipt: dict, *, replayed: bool) -> dict:
+    state = str(receipt.get("state") or "")
+    if (
+        state in {"creating", "running"}
+        and receipt.get("owner_boot_id") != _gateway_boot_id
+    ):
+        state = "indeterminate"
+    result = receipt.get("result")
+    projection = {
+        "idempotency_key": str(receipt.get("operation_id") or ""),
+        "kind": str(receipt.get("kind") or ""),
+        "replayed": replayed,
+        "session_key": str(receipt.get("session_key") or ""),
+        "state": state,
+    }
+    if isinstance(result, dict) and result.get("status"):
+        projection["status"] = str(result["status"])
+    return projection
+
+
+def _operation_receipt_conflict(
+    rid, receipt: dict, *, kind: str, request_hash: str
+) -> dict | None:
+    if (
+        receipt.get("kind") == kind
+        and receipt.get("request_hash") == request_hash
+    ):
+        return None
+    return _err(
+        rid,
+        4091,
+        "idempotency_key is already bound to a different request",
+    )
+
+
+def _finish_session_operation_receipt(
+    session: dict,
+    receipt_context: dict | None,
+    *,
+    state: str,
+    result: dict | None = None,
+    error: dict | None = None,
+) -> None:
+    if not receipt_context:
+        return
+    with _session_db(session) as db:
+        if db is None:
+            return
+        try:
+            db.finish_operation_receipt(
+                receipt_context["operation_id"],
+                claim_token=receipt_context["claim_token"],
+                state=state,
+                result=result,
+                error=error,
+            )
+        except Exception:
+            logger.warning(
+                "failed to finalize mutation receipt %s",
+                receipt_context["operation_id"],
+                exc_info=True,
+            )
+
+
 # ── Methods: session ─────────────────────────────────────────────────
 
 
 @method("session.create")
 def _(rid, params: dict) -> dict:
+    operation_id, operation_error = _idempotency_key(params)
+    if operation_error:
+        return _err(rid, 4004, operation_error)
     sid = uuid.uuid4().hex[:8]
     key = _new_session_key()
     cols = int(params.get("cols", 80))
@@ -6278,12 +6383,14 @@ def _(rid, params: dict) -> dict:
     # workspace (see _ensure_session_db_row); otherwise it lands in "No
     # workspace" instead of whatever folder the desktop launched in.
     raw_cwd = str(params.get("cwd") or "").strip()
+    request_cwd = os.path.abspath(os.path.expanduser(raw_cwd)) if raw_cwd else ""
     try:
-        explicit_cwd = bool(raw_cwd) and os.path.isdir(os.path.abspath(os.path.expanduser(raw_cwd)))
+        explicit_cwd = bool(raw_cwd) and os.path.isdir(request_cwd)
     except Exception:
         explicit_cwd = False
     resolved_cwd = _completion_cwd(params)
-    source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+    raw_source = str(params.get("source") or "").strip()
+    source = _resolve_session_source(raw_source or None)
     _enable_gateway_prompts()
 
     # ``profile`` (app-global remote mode): a new chat started under a non-launch
@@ -6321,49 +6428,194 @@ def _(rid, params: dict) -> dict:
             "priority" if is_truthy_value(params.get("fast")) else ""
         )
 
+    receipt = None
+    receipt_created = False
+    receipt_context = None
+    if operation_id:
+        request_hash = _operation_request_hash(
+            "session.create",
+            {
+                "close_on_disconnect": is_truthy_value(
+                    params.get("close_on_disconnect", False)
+                ),
+                "cwd": request_cwd,
+                "explicit_cwd": explicit_cwd,
+                "fast": (
+                    is_truthy_value(params.get("fast"))
+                    if "fast" in params
+                    else None
+                ),
+                "messages": history,
+                "model": create_model,
+                "parent_session_id": parent_session_id,
+                "profile": profile or "",
+                "provider": str(params.get("provider") or "").strip(),
+                "reasoning_effort": str(
+                    params.get("reasoning_effort") or ""
+                ).strip(),
+                "source": raw_source,
+                "title": title,
+            },
+        )
+        claim_token = uuid.uuid4().hex
+        with _profile_db(params) as receipt_db:
+            if receipt_db is None:
+                return _err(
+                    rid,
+                    5037,
+                    "state.db is required for idempotent session creation",
+                )
+            try:
+                created, receipt = receipt_db.claim_operation_receipt(
+                    operation_id,
+                    kind="session.create",
+                    request_hash=request_hash,
+                    session_key=key,
+                    state="creating",
+                    claim_token=claim_token,
+                    owner_boot_id=_gateway_boot_id,
+                    result={"stored_session_id": key},
+                )
+                receipt_created = created
+            except Exception:
+                logger.warning(
+                    "failed to claim idempotent session creation",
+                    exc_info=True,
+                )
+                return _err(rid, 5037, "could not claim session creation")
+
+        conflict = _operation_receipt_conflict(
+            rid,
+            receipt,
+            kind="session.create",
+            request_hash=request_hash,
+        )
+        if conflict is not None:
+            return conflict
+        key = str(receipt.get("session_key") or "")
+        receipt_context = {
+            "operation_id": operation_id,
+            "claim_token": str(receipt.get("claim_token") or ""),
+        }
+        if not created and receipt.get("state") == "failed":
+            stored_error = receipt.get("error")
+            if isinstance(stored_error, dict):
+                return _err(
+                    rid,
+                    int(stored_error.get("code") or 5000),
+                    str(stored_error.get("message") or "session creation failed"),
+                )
+        with _session_resume_lock:
+            live = _find_live_session_by_key(key)
+        if live is not None:
+            live_sid, live_session = live
+            if receipt.get("state") == "creating":
+                _finish_session_operation_receipt(
+                    live_session,
+                    receipt_context,
+                    state="completed",
+                    result={"status": "created", "stored_session_id": key},
+                )
+                with _profile_db(params) as receipt_db:
+                    if receipt_db is not None:
+                        receipt = (
+                            receipt_db.get_operation_receipt(operation_id)
+                            or receipt
+                        )
+            result = _live_session_payload(
+                live_sid,
+                live_session,
+                cols=cols,
+                touch=True,
+                transport=current_transport() or _stdio_transport,
+            )
+            result["stored_session_id"] = key
+            result["receipt"] = _operation_receipt_projection(
+                receipt,
+                replayed=True,
+            )
+            return _ok(rid, result)
+
     ready = threading.Event()
     now = time.time()
     lease, limit_message = _claim_active_session_slot(
         key, live_session_id=sid, surface=source
     )
     if limit_message is not None:
+        if receipt_context:
+            with _profile_db(params) as receipt_db:
+                if receipt_db is not None:
+                    receipt_db.finish_operation_receipt(
+                        operation_id,
+                        claim_token=receipt_context["claim_token"],
+                        state="failed",
+                        error={"code": 4090, "message": limit_message},
+                    )
         return _err(rid, 4090, limit_message)
 
-    with _sessions_lock:
-        _sessions[sid] = {
-            "agent": None,
-            "agent_error": None,
-            "agent_ready": ready,
-            "attached_images": [],
-            "close_on_disconnect": is_truthy_value(params.get("close_on_disconnect", False)),
-            "active_session_lease": lease,
-            "cols": cols,
-            "created_at": now,
-            "edit_snapshots": {},
-            "explicit_cwd": explicit_cwd,
-            "history": history,
-            "history_lock": threading.Lock(),
-            "history_version": 0,
-            "image_counter": 0,
-            "cwd": resolved_cwd,
-            "inflight_turn": None,
-            "last_active": now,
-            "model_override": session_model_override,
-            "create_reasoning_override": create_reasoning_override,
-            "create_service_tier_override": create_service_tier_override,
-            "parent_session_id": parent_session_id,
-            "pending_title": title or None,
-            "profile_home": str(profile_home) if profile_home is not None else None,
-            "running": False,
-            "session_key": key,
-            "show_reasoning": _load_show_reasoning(),
-            "source": source,
-            "slash_worker": None,
-            "tool_progress_mode": _load_tool_progress_mode(),
-            "tool_started_at": {},
-            "transport": current_transport() or _stdio_transport,
-        }
-        _register_session_cwd(_sessions[sid])
+    record = {
+        "agent": None,
+        "agent_error": None,
+        "agent_ready": ready,
+        "attached_images": [],
+        "close_on_disconnect": is_truthy_value(
+            params.get("close_on_disconnect", False)
+        ),
+        "active_session_lease": lease,
+        "cols": cols,
+        "created_at": now,
+        "edit_snapshots": {},
+        "explicit_cwd": explicit_cwd,
+        "history": history,
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "image_counter": 0,
+        "cwd": resolved_cwd,
+        "inflight_turn": None,
+        "last_active": now,
+        "model_override": session_model_override,
+        "create_reasoning_override": create_reasoning_override,
+        "create_service_tier_override": create_service_tier_override,
+        "parent_session_id": parent_session_id,
+        "pending_title": title or None,
+        "profile_home": str(profile_home) if profile_home is not None else None,
+        "running": False,
+        "session_key": key,
+        "show_reasoning": _load_show_reasoning(),
+        "source": source,
+        "slash_worker": None,
+        "tool_progress_mode": _load_tool_progress_mode(),
+        "tool_started_at": {},
+        "transport": current_transport() or _stdio_transport,
+    }
+    live = _claim_or_reuse_live(sid, key, record, lease)
+    if live is not None:
+        live_sid, live_session = live
+        result = _live_session_payload(
+            live_sid,
+            live_session,
+            cols=cols,
+            touch=True,
+            transport=current_transport() or _stdio_transport,
+        )
+        result["stored_session_id"] = key
+        if receipt:
+            result["receipt"] = _operation_receipt_projection(
+                receipt,
+                replayed=True,
+            )
+        return _ok(rid, result)
+
+    if receipt_context:
+        _finish_session_operation_receipt(
+            record,
+            receipt_context,
+            state="completed",
+            result={"status": "created", "stored_session_id": key},
+        )
+        with _profile_db(params) as receipt_db:
+            if receipt_db is not None:
+                receipt = receipt_db.get_operation_receipt(operation_id)
 
     # NOTE: we intentionally do NOT persist a DB row here. Every TUI/desktop
     # launch (and every "New agent" / draft) opens a session here just to paint
@@ -6379,9 +6631,7 @@ def _(rid, params: dict) -> dict:
     _schedule_agent_build(sid)
     _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
 
-    return _ok(
-        rid,
-        {
+    result = {
             "session_id": sid,
             "stored_session_id": key,
             "message_count": len(history),
@@ -6408,10 +6658,16 @@ def _(rid, params: dict) -> dict:
                 "project": _project_info_for_cwd(_sessions[sid]["cwd"]),
                 "lazy": True,
                 "desktop_contract": DESKTOP_BACKEND_CONTRACT,
+                "mutation_receipt_contract": MUTATION_RECEIPT_CONTRACT,
                 "profile_name": _response_profile_name(profile),
             },
-        },
-    )
+        }
+    if receipt:
+        result["receipt"] = _operation_receipt_projection(
+            receipt,
+            replayed=not receipt_created,
+        )
+    return _ok(rid, result)
 
 
 @method("session.list")
@@ -6574,6 +6830,7 @@ def _lazy_resume_info(
         "skills": {},
         "lazy": True,
         "desktop_contract": DESKTOP_BACKEND_CONTRACT,
+        "mutation_receipt_contract": MUTATION_RECEIPT_CONTRACT,
         "profile_name": _response_profile_name(profile),
     }
     if provider:
@@ -7178,9 +7435,11 @@ def _fallback_session_info(session: dict) -> dict:
     cwd = _default_session_cwd()
     return {
         "cwd": cwd,
+        "desktop_contract": DESKTOP_BACKEND_CONTRACT,
         "project": _project_info_for_cwd(cwd),
         "lazy": True,
         "model": _resolve_model(),
+        "mutation_receipt_contract": MUTATION_RECEIPT_CONTRACT,
         "skills": {},
         "tools": {},
     }
@@ -10165,13 +10424,241 @@ def _(rid, params: dict) -> dict:
 # ── Methods: prompt ──────────────────────────────────────────────────
 
 
+def _prompt_receipt_response(rid, receipt: dict, *, replayed: bool) -> dict:
+    projection = _operation_receipt_projection(receipt, replayed=replayed)
+    status = (
+        projection["state"]
+        if projection["state"] == "indeterminate"
+        else projection.get("status") or projection["state"]
+    )
+    if status == "running":
+        status = "streaming"
+    return _ok(rid, {"status": status, "receipt": projection})
+
+
+def _submit_idempotent_prompt(
+    rid,
+    params: dict,
+    *,
+    operation_id: str,
+    text: str,
+) -> dict:
+    """Submit the narrow v1 durable-receipt prompt contract.
+
+    V1 deliberately accepts only idle, text-only turns. Busy queues,
+    attachments, truncation, barge-in, and compute-host dispatch carry hidden
+    mutable state that is not durable yet; accepting them under a receipt would
+    imply recovery guarantees Hermes does not have.
+    """
+    if not isinstance(params.get("text", ""), str):
+        return _err(rid, 4030, "idempotent prompt.submit requires text-only input")
+    if params.get("truncate_before_user_ordinal") is not None:
+        return _err(rid, 4030, "idempotent prompt.submit does not support truncation")
+    if params.get("interrupted"):
+        return _err(rid, 4030, "idempotent prompt.submit does not support barge-in")
+
+    stored_session_id = str(params.get("stored_session_id") or "").strip()
+    if not stored_session_id:
+        return _err(
+            rid,
+            4030,
+            "stored_session_id is required for idempotent prompt.submit",
+        )
+    request_hash = _operation_request_hash(
+        "prompt.submit",
+        {"session_key": stored_session_id, "text": text},
+    )
+
+    # Replay before resolving the volatile live session. This is what lets a
+    # caller reconcile an acknowledgement lost across gateway restart without
+    # authorizing a second dispatch.
+    with _profile_db(params) as receipt_db:
+        if receipt_db is None:
+            return _err(
+                rid,
+                5037,
+                "state.db is required for idempotent prompt submission",
+            )
+        existing = receipt_db.get_operation_receipt(operation_id)
+    if existing is not None:
+        conflict = _operation_receipt_conflict(
+            rid,
+            existing,
+            kind="prompt.submit",
+            request_hash=request_hash,
+        )
+        if conflict is not None:
+            return conflict
+        return _prompt_receipt_response(rid, existing, replayed=True)
+
+    sid = str(params.get("session_id") or "")
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    if _session_lookup_key(session, fallback=sid) != stored_session_id:
+        return _err(
+            rid,
+            4091,
+            "stored_session_id does not match the live session",
+        )
+    isolation_cfg = _load_dashboard_process_isolation_config()
+    if _session_uses_compute_host(session, isolation_cfg):
+        return _err(
+            rid,
+            4030,
+            "idempotent prompt.submit does not support compute-host isolation",
+        )
+    if (transport := current_transport()) is not None:
+        session["transport"] = transport
+
+    claim_token = uuid.uuid4().hex
+    with session["history_lock"]:
+        # A concurrent duplicate can pass the pre-session receipt lookup before
+        # the winner commits its claim. Recheck while holding the per-session
+        # mutation lock so that duplicate callers replay the receipt instead of
+        # being misclassified as unrelated busy-session traffic.
+        with _session_db(session) as receipt_db:
+            if receipt_db is None:
+                return _err(
+                    rid,
+                    5037,
+                    "state.db is required for idempotent prompt submission",
+                )
+            existing = receipt_db.get_operation_receipt(operation_id)
+        if existing is not None:
+            conflict = _operation_receipt_conflict(
+                rid,
+                existing,
+                kind="prompt.submit",
+                request_hash=request_hash,
+            )
+            if conflict is not None:
+                return conflict
+            return _prompt_receipt_response(rid, existing, replayed=True)
+
+        if session.get("running") or session.get("queued_prompt"):
+            return _err(
+                rid,
+                4030,
+                "idempotent prompt.submit requires an idle session",
+            )
+        if session.get("attached_images"):
+            return _err(
+                rid,
+                4030,
+                "idempotent prompt.submit does not support attachments",
+            )
+        if session.get("lazy") and _child_run_active(stored_session_id):
+            return _err(rid, 4009, "subagent still running — wait for it to finish")
+
+        with _session_db(session) as receipt_db:
+            if receipt_db is None:
+                return _err(
+                    rid,
+                    5037,
+                    "state.db is required for idempotent prompt submission",
+                )
+            try:
+                created, receipt = receipt_db.claim_operation_receipt(
+                    operation_id,
+                    kind="prompt.submit",
+                    request_hash=request_hash,
+                    session_key=stored_session_id,
+                    state="running",
+                    claim_token=claim_token,
+                    owner_boot_id=_gateway_boot_id,
+                    result={"status": "streaming"},
+                )
+            except Exception:
+                logger.warning(
+                    "failed to claim idempotent prompt submission",
+                    exc_info=True,
+                )
+                return _err(rid, 5037, "could not claim prompt submission")
+
+        conflict = _operation_receipt_conflict(
+            rid,
+            receipt,
+            kind="prompt.submit",
+            request_hash=request_hash,
+        )
+        if conflict is not None:
+            return conflict
+        if not created:
+            return _prompt_receipt_response(rid, receipt, replayed=True)
+
+        session["running"] = True
+        session["_turn_cancel_requested"] = False
+        session["last_active"] = time.time()
+        _start_inflight_turn(session, text)
+
+    receipt_context = {
+        "operation_id": operation_id,
+        "claim_token": claim_token,
+    }
+    _ensure_session_db_row(session)
+    _persist_branch_seed(session)
+    _start_agent_build(sid, session)
+
+    def run_after_agent_ready() -> None:
+        wait_error = _wait_agent(session, rid)
+        if wait_error:
+            message = (wait_error.get("error") or {}).get(
+                "message", "agent initialization failed"
+            )
+            _emit("error", sid, {"message": message})
+            with session["history_lock"]:
+                session["running"] = False
+                _clear_inflight_turn(session)
+            _finish_session_operation_receipt(
+                session,
+                receipt_context,
+                state="failed",
+                error={"message": message},
+            )
+            return
+        with session["history_lock"]:
+            if session.get("_turn_cancel_requested") or not session.get("running"):
+                session["running"] = False
+                _clear_inflight_turn(session)
+                _finish_session_operation_receipt(
+                    session,
+                    receipt_context,
+                    state="completed",
+                    result={"status": "interrupted"},
+                )
+                return
+        _run_prompt_submit(
+            rid,
+            sid,
+            session,
+            text,
+            operation_receipt=receipt_context,
+        )
+
+    run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
+    session["_run_thread"] = run_thread
+    run_thread.start()
+    return _prompt_receipt_response(rid, receipt, replayed=False)
+
+
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     from hermes_cli.input_sanitize import sanitize_user_prompt_text
 
+    operation_id, operation_error = _idempotency_key(params)
+    if operation_error:
+        return _err(rid, 4004, operation_error)
     sid = params.get("session_id", "")
     raw_text = params.get("text", "")
     text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
+    if operation_id:
+        return _submit_idempotent_prompt(
+            rid,
+            params,
+            operation_id=operation_id,
+            text=text,
+        )
     truncate_user_ordinal = params.get("truncate_before_user_ordinal")
     if params.get("interrupted"):
         # Client-side barge-in (desktop VAD / typing over playback) — latch it
@@ -10803,6 +11290,7 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
 def _run_prompt_submit(
     rid, sid: str, session: dict, text: Any, *, display_kind: str | None = None,
     display_metadata: dict | None = None,
+    operation_receipt: dict | None = None,
 ) -> None:
     with session["history_lock"]:
         history = list(session["history"])
@@ -10826,6 +11314,9 @@ def _run_prompt_submit(
         goal_followup = None  # set by the post-turn goal hook below
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
         one_turn_restore = session.pop("one_turn_model_restore", None)
+        receipt_state = "failed"
+        receipt_result = None
+        receipt_error = {"message": "prompt execution did not complete"}
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -11132,6 +11623,13 @@ def _run_prompt_submit(
                 status = "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            receipt_state = "failed" if status == "error" else "completed"
+            receipt_result = {"status": status}
+            receipt_error = (
+                {"message": str(result.get("error") or "prompt execution failed")}
+                if status == "error" and isinstance(result, dict)
+                else None
+            )
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:
@@ -11150,6 +11648,17 @@ def _run_prompt_submit(
                 payload["rendered"] = rendered
             with session["history_lock"]:
                 _clear_inflight_turn(session)
+            # Publish terminal receipt state before the client-visible
+            # completion event. Otherwise an immediate reconciliation can
+            # observe the stale running receipt and wait for an event that has
+            # already been emitted.
+            _finish_session_operation_receipt(
+                session,
+                operation_receipt,
+                state=receipt_state,
+                result=receipt_result,
+                error=receipt_error,
+            )
             _emit("message.complete", sid, payload)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
@@ -11312,6 +11821,9 @@ def _run_prompt_submit(
                 f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True
             )
             _emit("error", sid, {"message": str(e)})
+            receipt_state = "failed"
+            receipt_result = None
+            receipt_error = {"message": str(e)}
         finally:
             if tts_queue is not None:
                 tts_queue.put(None)  # end-of-text sentinel — flush + finish speaking
@@ -11338,6 +11850,13 @@ def _run_prompt_submit(
                 session["running"] = False
                 session["last_active"] = time.time()
                 _clear_inflight_turn(session)
+            _finish_session_operation_receipt(
+                session,
+                operation_receipt,
+                state=receipt_state,
+                result=receipt_result,
+                error=receipt_error,
+            )
             _emit("session.info", sid, _session_info(agent, session))
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
