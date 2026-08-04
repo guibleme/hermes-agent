@@ -12832,6 +12832,27 @@ async def set_webhook_enabled(name: str, body: WebhookEnabledToggle):
 
 @app.post("/api/gateway/start")
 async def start_gateway(profile: Optional[str] = None):
+    # Check if gateway is already running and healthy before spawning
+    # This prevents the Desktop from killing existing gateways with --replace
+    import os
+    from gateway.status import read_runtime_status
+    
+    try:
+        status = read_runtime_status()
+        if status:
+            gateway_state = status.get("gateway_state")
+            pid = status.get("pid")
+            # Only skip if gateway is actually running (state=running AND PID is alive)
+            if gateway_state == "running" and pid:
+                try:
+                    os.kill(pid, 0)  # Check if process exists
+                    _log.info(f"Gateway already running (PID {pid}, state={gateway_state}), skipping start")
+                    return {"ok": True, "pid": pid, "name": "gateway-start", "already_running": True}
+                except (OSError, ProcessLookupError):
+                    _log.warning(f"Gateway state says running but PID {pid} is dead, proceeding with start")
+    except Exception as exc:
+        _log.warning(f"Failed to check gateway status, proceeding with start: {exc}")
+    
     try:
         proc = _spawn_hermes_action(_gateway_subcommand(profile, "start"), "gateway-start")
     except HTTPException:

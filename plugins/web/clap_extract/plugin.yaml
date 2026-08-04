@@ -1,0 +1,7 @@
+name: web-clap-extract
+version: 1.0.0
+description: "clap-extract — lightweight URL-to-markdown extraction via local Python server. Supports web_extract. No JS rendering (trafilatura)."
+author: ClapTARS
+kind: backend
+provides_web_providers:
+  - clap-extract
