@@ -4270,6 +4270,17 @@ class AIAgent:
         # Shared/primary clients and Anthropic / Bedrock paths are
         # unaffected (they don't go through here).
         request_kwargs["max_retries"] = 0
+        # OpenCode Go requires a stable per-conversation routing key. Hermes
+        # already owns exactly that key as session_id, but historically did
+        # not forward it on OpenAI-compatible requests.
+        if (
+            self.provider == "opencode-go"
+            and base_url_host_matches(str(request_kwargs.get("base_url", "")), "opencode.ai")
+            and getattr(self, "session_id", None)
+        ):
+            request_headers = dict(request_kwargs.get("default_headers") or {})
+            request_headers["x-opencode-session"] = str(self.session_id)
+            request_kwargs["default_headers"] = request_headers
         if (
             base_url_host_matches(str(request_kwargs.get("base_url", "")), "githubcopilot.com")
             and self._api_kwargs_have_image_parts(api_kwargs or {})
